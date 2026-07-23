@@ -1,0 +1,19 @@
+# ---- Module 2 phần AI (nặng, cần GPU để dùng thực tế) ----
+# Cài SAU khi đã cài torch đúng bản CUDA cho máy bạn.
+# Ví dụ (CUDA 12.1):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# rồi mới:
+#   pip install -r requirements-ml.txt
+
+# ---- Tách giọng: chọn backend theo cấu hình máy (audio.separator_backend) ----
+audio-separator>=0.17       # backend "mdx" (ONNX) & "vr" — NHẸ, chạy CPU tốt (KHUYÊN cho máy yếu)
+# demucs>=4.0               # backend "demucs" — chất lượng cao nhất nhưng NẶNG, cần GPU (tùy chọn)
+
+faster-whisper>=1.0         # transcribe -> content.txt + cue phụ đề (nhanh hơn openai-whisper)
+ultralytics>=8.1            # YOLO: dò người/đối tượng cho smart-crop
+librosa>=0.10               # phân tích audio (pitch/tempo hỗ trợ)
+soundfile>=0.12
+
+# ---- Dịch phụ đề (miễn phí, KHÔNG cần key) — chọn 1 hoặc cả 2 ----
+deep-translator>=1.11       # Google Translate (chất lượng cao, cần mạng)
+# argostranslate>=1.9       # dịch máy neural OFFLINE (bỏ chú thích nếu muốn dịch offline)

@@ -1,0 +1,15 @@
+# ---- Core (Module 1 + GUI + video/audio FFmpeg pipeline) ----
+PySide6>=6.6,<7
+yt-dlp>=2024.1.0            # cập nhật thường xuyên: đừng pin cứng, chạy `pip install -U yt-dlp` định kỳ
+feedparser>=6.0            # đọc RSS feed kênh YouTube (không tốn quota API)
+APScheduler>=3.10,<4       # job quét định kỳ 30 phút
+PyYAML>=6.0                # đọc config.yaml
+requests>=2.31
+openpyxl>=3.1             # kho trạng thái = file Excel nhiều sheet (thay cho database)
+
+# ---- Xử lý ảnh / smart-crop ----
+opencv-python>=4.9
+numpy>=1.26
+
+# Ghi chú: FFmpeg KHÔNG cài qua pip. Xem README (bundle ffmpeg.exe hoặc cài qua winget/choco).
+# Các thư viện AI nặng (Demucs, Whisper, YOLO) nằm ở requirements-ml.txt để tách phần cài đặt.

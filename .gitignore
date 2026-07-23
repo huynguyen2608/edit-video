@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+config.yaml
+data.xlsx
+data.xlsx.tmp
+logs/
+build/
+dist/
+*.spec
