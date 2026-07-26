@@ -31,6 +31,45 @@ def test_import_and_jobs(tmp_path):
     assert j.output_dir  # có đường dẫn output
 
 
+def test_reset_for_redownload_requeues_removed(tmp_path):
+    """Bug C: video từng bị xóa khỏi hàng đợi (Removed) -> tải lại phải quay lại 'Đang chờ'."""
+    qm, db = _qm(tmp_path)
+    db.add_discovered("v", "ch", "channel", "title", "https://youtube.com/watch?v=v", "now")
+    db.set_download_status("v", "downloaded", path=str(tmp_path / "v.mp4"))
+    qm.remove_from_queue(["v"])                       # -> job_status = Removed
+    assert "v" not in [j.video_id for j in qm.jobs()]
+    assert qm.next_pending() is None
+    db.reset_for_redownload("v")                      # tải lại: phải dọn Removed
+    db.set_download_status("v", "downloaded", path=str(tmp_path / "v.mp4"))
+    row = next(r for r in db.all_video_rows() if r["video_id"] == "v")
+    assert display_status(row) == Status.WAITING
+    assert "v" in [j.video_id for j in qm.jobs()]
+    assert qm.next_pending() == "v"
+
+
+def test_next_pending_exclude(tmp_path):
+    """Bug D: tạm dừng -> loại trừ video vừa dừng, chọn video khác; hết mới quay lại."""
+    qm, db = _qm(tmp_path)
+    for vid in ("a", "b"):
+        db.add_discovered(vid, "ch", "channel", vid, f"https://y/{vid}", vid)
+        db.set_download_status(vid, "downloaded", path=str(tmp_path / f"{vid}.mp4"))
+    assert qm.next_pending(exclude={"a"}) == "b"        # bỏ a -> còn b
+    assert qm.next_pending(exclude={"a", "b"}) is None  # loại hết -> None (worker sẽ thử lại)
+    assert qm.next_pending(preferred_id="a", exclude={"a"}) == "b"  # preferred bị loại -> FIFO còn lại
+
+
+def test_paused_job_not_autopicked_but_counts_as_waiting(tmp_path):
+    """Tạm dừng video -> PAUSED: KHÔNG tự chạy lại, nhưng đếm ở 'Đang chờ' + hiện 'Tạm dừng'."""
+    qm, db = _qm(tmp_path)
+    db.add_discovered("v", "ch", "channel", "title", "url", "now")
+    db.set_download_status("v", "downloaded", path=str(tmp_path / "v.mp4"))
+    db.update_job("v", job_status=Status.PAUSED, stage="", progress=0)
+    row = next(r for r in db.all_video_rows() if r["video_id"] == "v")
+    assert display_status(row) == Status.PAUSED       # hiển thị 'Tạm dừng'
+    assert qm.next_pending() is None                  # KHÔNG tự chạy lại
+    assert qm.dashboard()["waiting"] == 1             # nhưng đếm ở 'Đang chờ'
+
+
 def test_dashboard_counts(tmp_path):
     inp = tmp_path / "in"; inp.mkdir()
     for n in ("a.mp4", "b.mp4", "c.mp4"):
@@ -93,6 +132,22 @@ def test_retry_failed(tmp_path):
     assert vid in qm.runnable_ids()
 
 
+def test_selected_paused_job_can_run_before_fifo(tmp_path):
+    inp = tmp_path / "in"; inp.mkdir()
+    _mk(inp / "a.mp4"); _mk(inp / "b.mp4")
+    qm, db = _qm(tmp_path)
+    ids = qm.import_paths([str(inp)])["eligible"]
+    selected = ids[1]
+    db.update_job(selected, job_status=Status.PAUSED, stage="Rendering", progress=42)
+
+    assert qm.prepare_for_run(selected)
+    assert qm.next_pending(preferred_id=selected) == selected
+    row = next(r for r in db.all_video_rows() if r["video_id"] == selected)
+    assert row["job_status"] == Status.WAITING
+    assert row["edit_status"] == "pending"
+    assert row["progress"] == 0
+
+
 def test_cancelled_batch_download_becomes_paused(tmp_path):
     cfg = AppConfig()
     cfg.download.root_dir = str(tmp_path / "downloads")
@@ -128,3 +183,37 @@ def test_clear_and_rebuild_queue_keeps_video_record(tmp_path):
     assert qm.rebuild_queue() == 1
     assert [job.video_id for job in qm.jobs()] == [video_id]
     assert video_id in qm.runnable_ids()
+
+
+def test_reimport_folder_restores_removed_failed_video(tmp_path):
+    inp = tmp_path / "in"; inp.mkdir()
+    _mk(inp / "retry.mp4")
+    qm, db = _qm(tmp_path)
+    video_id = qm.import_paths([str(inp)])["eligible"][0]
+    db.set_edit_status(video_id, "failed", error="old failure")
+    assert qm.remove_from_queue([video_id]) == 1
+    assert qm.jobs() == []
+
+    result = qm.import_paths([str(inp)])
+
+    assert result["total"] == 1
+    assert result["eligible"] == [video_id]
+    jobs = qm.jobs()
+    assert [job.video_id for job in jobs] == [video_id]
+    assert jobs[0].status == Status.WAITING
+    assert qm.next_pending() == video_id
+
+
+def test_reimport_folder_does_not_restart_completed_video(tmp_path):
+    inp = tmp_path / "in"; inp.mkdir()
+    _mk(inp / "done.mp4")
+    qm, db = _qm(tmp_path)
+    video_id = qm.import_paths([str(inp)])["eligible"][0]
+    db.set_edit_status(video_id, "done")
+    qm.remove_from_queue([video_id])
+
+    result = qm.import_paths([str(inp)])
+
+    assert result["eligible"] == []
+    assert result["skipped_done"] == 1
+    assert qm.jobs() == []

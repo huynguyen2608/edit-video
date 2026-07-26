@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..logging_setup import get_logger
 from ..paths import safe_name
+from .stages import Status
 
 log = get_logger("local_source")
 
@@ -54,6 +55,28 @@ def video_id_for(path: str | Path) -> str:
     return f"local_{safe_name(p.stem, 32)}_{h}"
 
 
+def _restore_imported_job(store, video_id: str):
+    """Khôi phục video local được nhập lại sau khi từng bị xóa khỏi Queue."""
+    row = store.get_video(video_id)
+    if not row:
+        return None
+    # Video hoàn thành vẫn được giữ nguyên và không tự chạy lại.
+    if row.edit_status == "done":
+        return row
+    if row.edit_status == "failed":
+        store.set_edit_status(video_id, "pending", error=None)
+        row = store.get_video(video_id)
+    raw = next(
+        (item for item in store.all_video_rows() if item.get("video_id") == video_id),
+        None,
+    )
+    if raw and raw.get("job_status") == Status.REMOVED:
+        store.update_job(
+            video_id, job_status=Status.WAITING, stage="", progress=0, error=None)
+        row = store.get_video(video_id)
+    return row
+
+
 def ingest_paths(store, paths, channel_name: str | None = None) -> dict:
     """Nạp danh sách ĐƯỜNG DẪN (file và/hoặc folder) — dùng cho drag&drop vào Queue.
 
@@ -81,10 +104,7 @@ def ingest_paths(store, paths, channel_name: str | None = None) -> dict:
         ch = channel_name or safe_name(f.parent.name) or "Local"
         if store.add_local_video(vid, ch, f.name, str(f)):
             added += 1
-        row = store.get_video(vid)
-        if row and row.edit_status == "failed":
-            store.set_edit_status(vid, "pending")
-            row = store.get_video(vid)
+        row = _restore_imported_job(store, vid)
         if row and row.edit_status == "pending" and row.download_status == "downloaded":
             eligible.append(vid)
         elif row and row.edit_status == "done":
@@ -95,7 +115,8 @@ def ingest_paths(store, paths, channel_name: str | None = None) -> dict:
             "skipped_done": skipped_done}
 
 
-def ingest_folder(store, folder: str | Path, channel_name: str | None = None) -> dict:
+def ingest_folder(store, folder: str | Path, channel_name: str | None = None,
+                  retry_failed: bool = True) -> dict:
     """Nạp mọi video trong folder vào kho; trả thống kê + danh sách id CẦN edit.
 
     - channel_name: nhóm output theo tên này (mặc định lấy tên folder) ->
@@ -113,9 +134,17 @@ def ingest_folder(store, folder: str | Path, channel_name: str | None = None) ->
         if store.add_local_video(vid, channel, f.name, str(f)):
             added += 1
         row = store.get_video(vid)
-        if row and row.edit_status == "failed":
-            store.set_edit_status(vid, "pending")   # cho phép edit lại
-            row = store.get_video(vid)
+        if retry_failed:
+            row = _restore_imported_job(store, vid)
+        elif row and row.edit_status != "done":
+            raw = next(
+                (item for item in store.all_video_rows() if item.get("video_id") == vid),
+                None,
+            )
+            if raw and raw.get("job_status") == Status.REMOVED:
+                store.update_job(
+                    vid, job_status=Status.WAITING, stage="", progress=0, error=None)
+                row = store.get_video(vid)
         if row and row.edit_status == "pending" and row.download_status == "downloaded":
             eligible.append(vid)
         elif row and row.edit_status == "done":

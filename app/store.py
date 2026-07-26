@@ -358,6 +358,28 @@ class ExcelStore:
                 self._save()
             return n
 
+    def reset_for_redownload(self, video_id: str) -> bool:
+        """Đưa 1 video về tải lại TỪ ĐẦU: xóa path cũ, pending cả tải lẫn edit.
+
+        Dùng cho 'Tải lại video lỗi' và đối chiếu file mất. Trả True nếu có video.
+        """
+        with self._lock:
+            row = self._videos.get(video_id)
+            if not row:
+                return False
+            row["download_status"] = "pending"
+            row["download_path"] = ""
+            row["edit_status"] = "pending"
+            row["error"] = None
+            row["edited_at"] = None
+            # Dọn trạng thái hàng đợi cũ (Removed/Failed/Paused…) để video quay lại
+            # 'Đang chờ' -> hiện trong Hàng đợi và được tự biên tập sau khi tải lại.
+            row["job_status"] = ""
+            row["stage"] = ""
+            row["progress"] = 0
+            self._save()
+            return True
+
     def resume_paused_downloads(self, video_ids=None) -> int:
         """Đưa video tải tạm dừng về pending; file .part được yt-dlp dùng để tải tiếp."""
         wanted = set(video_ids) if video_ids is not None else None
@@ -395,6 +417,23 @@ class ExcelStore:
             if n:
                 self._save()
             return n
+
+    def remove_incomplete_remote_videos(self) -> int:
+        """Dọn bản ghi tải từ xa chưa hoàn tất; giữ local và mọi video đã tải.
+
+        Chỉ xóa bản ghi trong kho, không xóa file video hay kết quả đầu ra.
+        """
+        with self._lock:
+            targets = [
+                video_id for video_id, row in self._videos.items()
+                if not str(video_id).startswith("local_")
+                and row.get("download_status") != "downloaded"
+            ]
+            for video_id in targets:
+                self._videos.pop(video_id, None)
+            if targets:
+                self._save()
+            return len(targets)
 
     def update_job(self, video_id: str, *, persist: bool = True, **fields) -> None:
         """Cập nhật field queue (job_status/stage/progress/duration/resolution/fps…).

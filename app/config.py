@@ -89,6 +89,27 @@ class AudioCfg:
     audio_speed: float = 1.0
     mute_all: bool = False   # xóa HẾT âm thanh của video xuất (kể cả voice)
     duck_music: bool = True  # nhạc nền tự HẠ khi có lời thoại (sidechaincompress)
+    # Giữ track lời thoại gốc, chỉ làm sạch/cân bằng nhẹ. Tắt mặc định để config
+    # cũ tiếp tục copy nguyên audio cho tới khi người dùng chủ động chọn chế độ.
+    enhance_original_voice: bool = False
+    gain_db: float = 0.0
+    bass_db: float = 0.0
+    mid_db: float = 0.5
+    treble_db: float = 0.5
+    highpass_hz: int = 80       # 0 = tắt
+    lowpass_hz: int = 18000     # 0 = tắt
+    noise_reduction_percent: int = 10
+    compressor_enabled: bool = True
+    compressor_threshold_db: float = -18.0
+    compressor_ratio: float = 2.0
+    compressor_attack_ms: float = 10.0
+    compressor_release_ms: float = 100.0
+    deesser_db: float = 0.0     # 0 = tắt
+    loudness_enabled: bool = True
+    loudness_stereo_lufs: float = -16.0
+    loudness_mono_lufs: float = -19.0
+    limiter_enabled: bool = True
+    limiter_ceiling_db: float = -1.0
 
 
 @dataclass
@@ -105,13 +126,24 @@ class SubtitleCfg:
 
 
 @dataclass
+class TtsCfg:
+    enabled: bool = False
+    # Khi phụ đề bật, ngôn ngữ đọc lấy từ translate_to (hoặc ngôn ngữ được nhận diện).
+    # language chỉ dùng khi phụ đề tắt.
+    language: str = "vi"
+    voice: str = ""                 # ShortName của Edge TTS; rỗng = tự chọn phù hợp
+    gender: str = ""                # "" | Female | Male
+    rate_percent: int = 0
+
+
+@dataclass
 class ExportCfg:
     make_short: bool = True
     short_seconds: int = 100
     short_mode: str = "start"   # start = 100s đầu | highlight = đoạn sôi động nhất
     short_cut_mode: str = "accurate"  # accurate = đúng frame | fast = stream copy
     make_full: bool = True
-    make_content_txt: bool = True
+    make_content_txt: bool = False
     video_codec: str = "libx264"
     crf_or_cq: int = 20
     encoder_preset: str = "slow"
@@ -127,6 +159,8 @@ class EditorCfg:
     processing_device: str = "auto"        # auto | cuda | cpu (Whisper/Demucs)
     # Folder video đầu vào cho luồng edit ĐỘC LẬP (không cần tải từ YouTube).
     input_folder: str = ""
+    # 0 = off; 4/5 = split videos longer than 10 minutes before processing.
+    long_video_segment_minutes: int = 0
     target_aspect: str = "9:16"
     crop_mode: str = "auto"          # auto (dò chủ thể) | manual (dùng manual_focus_*) | center
     fill_missing: str = "blur"       # blur | pad_black | none (crop-to-fill quanh focus)
@@ -134,6 +168,7 @@ class EditorCfg:
     # Crop bớt HAI BÊN của video chính (foreground) TRƯỚC khi scale, ở chế độ blur —
     # để nội dung hiển thị to hơn. Tính theo % CHIỀU RỘNG mỗi bên, chỉnh 0..10 (mặc định 5).
     side_crop_percent: float = 2.0
+    side_squeeze_percent: float = 0.0   # nén ngang nguồn ĐÚNG 16:9 trước khi reframe (0..10%)
     manual_focus_x: float = 0.5      # dùng khi crop_mode=manual (toạ độ chuẩn hoá 0..1)
     manual_focus_y: float = 0.5
     fingerprint_enabled: bool = False  # biến đổi nhẹ MỖI video để chống trùng nội dung
@@ -146,6 +181,7 @@ class EditorCfg:
     picture_in_picture: PipCfg = field(default_factory=PipCfg)
     audio: AudioCfg = field(default_factory=AudioCfg)
     subtitle: SubtitleCfg = field(default_factory=SubtitleCfg)
+    tts: TtsCfg = field(default_factory=TtsCfg)
     intro_hook: TextOverlayCfg = field(default_factory=lambda: TextOverlayCfg(seconds=3, position="top"))
     outro_cta: TextOverlayCfg = field(default_factory=lambda: TextOverlayCfg(seconds=10, position="bottom", font_size=42))
     export: ExportCfg = field(default_factory=ExportCfg)

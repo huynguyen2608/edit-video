@@ -21,14 +21,14 @@ download:
   lookback_days: 1
   # Tần suất quét tự động (phút).
   scan_interval_minutes: 30
-  max_parallel: 1              # số video tải song song (1 = an toàn; tăng dễ bị chặn bot)
-  retry_failed: true          # mỗi lần quét, thử lại video tải lỗi trước đó
+  max_parallel: 1 # số video tải song song (1 = an toàn; tăng dễ bị chặn bot)
+  retry_failed: true # mỗi lần quét, thử lại video tải lỗi trước đó
   # Dùng cookies từ trình duyệt để giảm bị chặn bot (chrome/edge/firefox). Để trống = không dùng.
   cookies_from_browser: ""
-  cookies_file: ""              # file Netscape cookies.txt (ổn định khi Chrome đang mở)
+  cookies_file: "" # file Netscape cookies.txt (ổn định khi Chrome đang mở)
 
 editor:
-  processing_device: auto   # auto | cuda | cpu (AI nhận diện lời nói/tách giọng)
+  processing_device: auto # auto | cuda | cpu (AI nhận diện lời nói/tách giọng)
   # Thư mục xuất bản kết quả đã edit.
   output_dir: "D:/VideoRepurpose/output"
   # Tải xong 1 video -> tự đẩy sang HÀNG ĐỢI edit (một luồng xử lý lần lượt).
@@ -37,108 +37,120 @@ editor:
   # Folder video đầu vào cho luồng edit ĐỘC LẬP (không cần tải từ YouTube).
   # Bỏ file video vào đây rồi bấm "Import + Edit video trong folder" (hoặc CLI --edit-folder).
   input_folder: ""
+  # 0 = không chia; 4/5 = video dài hơn 10 phút được xử lý tuần tự theo từng phần.
+  long_video_segment_minutes: 0
 
   # ----- Khung hình đầu ra -----
-  target_aspect: "9:16"        # 9:16 | 1:1 | 16:9
+  target_aspect: "9:16" # 9:16 | 1:1 | 16:9
   # crop_mode CHỈ có tác dụng khi fill_missing="none" (crop-to-fill quanh vùng action):
   #   auto   = tự dò chủ thể (khuôn mặt); manual = dùng manual_focus_* bên dưới
   #            (hoặc bấm nút "Chọn vùng crop" trên GUI); center = canh giữa.
   crop_mode: "auto"
   # blur/pad_black = GIỮ TOÀN BỘ nội dung, lấp phần thiếu (viền mờ / đen), canh giữa.
   # none          = crop-to-fill: cắt quanh vùng action chính cho lấp đầy khung.
-  fill_missing: "blur"         # blur | pad_black | none
-  zoom_fill_percent: 0         # mặc định không zoom để giữ gần nguồn
-  fingerprint_enabled: false   # biến đổi NHẸ mỗi video (speed/màu/zoom) để chống trùng nội dung
-  fingerprint_strength: 1.0    # 0..2
+  fill_missing: "blur" # blur | pad_black | none
+  zoom_fill_percent: 0 # mặc định không zoom để giữ gần nguồn
+  fingerprint_enabled: false # biến đổi NHẸ mỗi video (speed/màu/zoom) để chống trùng nội dung
+  fingerprint_strength: 1.0 # 0..2
   # Chế độ blur (vd 16:9 -> 9:16): cắt bớt HAI BÊN video chính trước khi scale để
   # nội dung hiển thị to hơn. % chiều rộng mỗi bên, chỉnh 0..10.
-  side_crop_percent: 2          # thay đổi nhẹ, vẫn giữ phần lớn khung hình
-  manual_focus_x: 0.5          # tâm vùng crop thủ công (0..1) khi crop_mode="manual"
+  side_crop_percent: 2 # thay đổi nhẹ, vẫn giữ phần lớn khung hình
+  side_squeeze_percent: 0 # 0..10: CHỈ nguồn 16:9, nén ngang trước khi cắt 2 bên (giữ nội dung 2 bên)
+  manual_focus_x: 0.5 # tâm vùng crop thủ công (0..1) khi crop_mode="manual"
   manual_focus_y: 0.5
 
   # ----- Video fingerprint / biến đổi -----
+  # ----- Lồng tiếng Edge TTS -----
+  tts:
+    enabled: false
+    language: "vi" # chỉ dùng khi phụ đề tắt
+    voice: "" # rỗng = tự chọn từ danh sách giọng Edge
+    gender: "" # "" | Female | Male
+    rate_percent: 0 # -50..100
+
   flip_horizontal: false
   mirror_crop: false
-  speed: 0.98                  # thay đổi nhẹ; áp đồng bộ cho cả video và audio
+  speed: 0.98 # thay đổi nhẹ; áp đồng bộ cho cả video và audio
   color_grading:
     enabled: false
-    brightness: 0.0            # -1..1
-    contrast: 1.0              # 0..2
-    saturation: 1.0            # 0..3
+    brightness: 0.0 # -1..1
+    contrast: 1.0 # 0..2
+    saturation: 1.0 # 0..3
   overlay:
     enabled: false
-    image_path: ""             # logo/watermark png (có alpha)
-    position: "top-right"      # top-left | top-right | bottom-left | bottom-right
+    image_path: "" # logo/watermark png (có alpha)
+    position: "top-right" # top-left | top-right | bottom-left | bottom-right
     opacity: 0.8
-    scale: 0.0                 # 0 = giữ nguyên size; >0 = tỉ lệ theo chiều rộng khung (vd 0.15)
+    scale: 0.0 # 0 = giữ nguyên size; >0 = tỉ lệ theo chiều rộng khung (vd 0.15)
 
   # Chữ HOOK hiện ở giây ĐẦU + CTA ở giây CUỐI (bật/tắt, đổi vị trí & cỡ chữ)
   intro_hook:
     enabled: false
-    text: ""                   # nội dung hook (giây đầu). Để trống + auto:true -> tự lấy câu mở đầu
+    text: "" # nội dung hook (giây đầu). Để trống + auto:true -> tự lấy câu mở đầu
     seconds: 3
-    position: "top"            # top | middle | bottom
-    font_size: 48
-    box: true                  # nền hộp bán trong suốt cho dễ đọc
-    fade_ms: 300               # mờ dần vào/ra
-    auto: false                # tự gợi ý hook từ transcript nếu text trống
+    position: "top" # top | middle | bottom
+    font_size: 16
+    box: true # nền hộp bán trong suốt cho dễ đọc
+    fade_ms: 300 # mờ dần vào/ra
+    auto: false # tự gợi ý hook từ transcript nếu text trống
   outro_cta:
     enabled: false
-    text: ""                   # nội dung CTA (giây cuối)
+    text: "" # nội dung CTA (giây cuối)
     seconds: 10
     position: "bottom"
-    font_size: 42
+    font_size: 16
     box: true
     fade_ms: 300
   picture_in_picture:
-    enabled: false             # nếu không chọn ảnh -> bỏ qua hoàn toàn
+    enabled: false # nếu không chọn ảnh -> bỏ qua hoàn toàn
     image_path: ""
-    scale: 0.25                # tỉ lệ so với khung
+    scale: 0.25 # tỉ lệ so với khung
     position: "bottom-right"
 
   # ----- Audio fingerprint / xử lý -----
   audio:
-    separate_speech: false     # tách giữ giọng thoại, bỏ nhạc nền
+    separate_speech: false # tách giữ giọng thoại, bỏ nhạc nền
     # Backend tách giọng: mdx (audio-separator/ONNX, NHẸ, chạy CPU tốt — khuyên máy yếu)
     #                     | demucs (chất lượng cao nhất, cần GPU) | vr (VR Architecture)
     separator_backend: "mdx"
-    separator_model: ""        # để trống = model mặc định của backend (mdx: UVR-MDX-NET-Voc_FT)
-    replace_music: ""          # đường dẫn file nhạc thay nền (để trống = không thay)
+    separator_model: "" # để trống = model mặc định của backend (mdx: UVR-MDX-NET-Voc_FT)
+    replace_music: "" # đường dẫn file nhạc thay nền (để trống = không thay)
     music_volume: 0.25
-    voiceover: ""              # đường dẫn file voiceover thay toàn bộ audio gốc (để trống = không)
-    pitch_shift_semitones: 0   # dịch cao độ (0 = không)
-    audio_speed: 1.0           # tinh chỉnh tempo RIÊNG cho audio (nhân thêm vào speed chung);
-                               # để 1.0 nếu không muốn audio lệch so với video
-    mute_all: false            # true = XÓA HẾT âm thanh của video xuất (kể cả voice)
-    duck_music: true           # nhạc nền tự HẠ khi có lời thoại (sidechaincompress)
+    voiceover: "" # đường dẫn file voiceover thay toàn bộ audio gốc (để trống = không)
+    pitch_shift_semitones: 0 # dịch cao độ (0 = không)
+    audio_speed:
+      1.0 # tinh chỉnh tempo RIÊNG cho audio (nhân thêm vào speed chung);
+      # để 1.0 nếu không muốn audio lệch so với video
+    mute_all: false # true = XÓA HẾT âm thanh của video xuất (kể cả voice)
+    duck_music: true # nhạc nền tự HẠ khi có lời thoại (sidechaincompress)
 
   # ----- Phụ đề & dịch -----
   subtitle:
-    enabled: false           # true = thêm phụ đề + xuất file .srt (file thứ 4)
-    translate_to: ""         # "" = giữ NGÔN NGỮ GỐC; vd "en","vi","ja" = dịch & hiển thị bản dịch
-    burn_in: true            # in phụ đề (chỉ ngôn ngữ đã chọn) lên video
-    position: "bottom"       # top | middle | bottom
-    font_size: 24
-    merge_gap_ms: 300        # gộp cue cách nhau < ngưỡng (đoạn ngắn gần nhau -> dịch không sai lời)
-    min_cue_ms: 1200         # cue ngắn hơn -> gộp với lân cận
-    max_cue_ms: 7000         # trần độ dài 1 cue sau khi gộp
-    translator: "auto"       # auto | google | argos | none (cần cài deep-translator / argostranslate)
+    enabled: false # true = thêm phụ đề + xuất file .srt (file thứ 4)
+    translate_to: "" # "" = giữ NGÔN NGỮ GỐC; vd "en","vi","ja" = dịch & hiển thị bản dịch
+    burn_in: true # in phụ đề (chỉ ngôn ngữ đã chọn) lên video
+    position: "bottom" # top | middle | bottom
+    font_size: 14
+    merge_gap_ms: 300 # gộp cue cách nhau < ngưỡng (đoạn ngắn gần nhau -> dịch không sai lời)
+    min_cue_ms: 1200 # cue ngắn hơn -> gộp với lân cận
+    max_cue_ms: 7000 # trần độ dài 1 cue sau khi gộp
+    translator: "auto" # auto | google | argos | none (cần cài deep-translator / argostranslate)
 
   # ----- Xuất bản -----
   export:
     make_short: true
-    short_seconds: 100         # video ngắn 100s
-    short_mode: "start"        # start = 100s đầu | highlight = đoạn sôi động nhất (tự dò)
+    short_seconds: 100 # video ngắn 100s
+    short_mode: "start" # start = 100s đầu | highlight = đoạn sôi động nhất (tự dò)
     short_cut_mode: "accurate" # accurate = đúng frame; fast = copy nhanh nhưng lệch keyframe
-    make_full: true            # bản full đã edit
-    make_content_txt: true     # file .txt nội dung (transcript/mô tả)
-    video_codec: "libx264"      # chất lượng ổn định; GPU NVIDIA có thể chọn h264_nvenc
-    crf_or_cq: 20               # 18=rất cao, 20=cân bằng chất lượng cao, 23=nhẹ hơn
+    make_full: true # bản full đã edit
+    make_content_txt: false # chỉ giữ 2 video đầu ra; transcript là file trung gian
+    video_codec: "libx264" # chất lượng ổn định; GPU NVIDIA có thể chọn h264_nvenc
+    crf_or_cq: 20 # 18=rất cao, 20=cân bằng chất lượng cao, 23=nhẹ hơn
     encoder_preset: "slow"
-    output_short_edge: 0        # 0=tự chọn theo nguồn; hoặc 720/1080/1440/2160
+    output_short_edge: 0 # 0=tự chọn theo nguồn; hoặc 720/1080/1440/2160
     audio_bitrate_kbps: 256
     copy_audio_when_unchanged: true
 
 logging:
-  level: "INFO"                # DEBUG | INFO | WARNING | ERROR
+  level: "INFO" # DEBUG | INFO | WARNING | ERROR
   file: "logs/app.log"

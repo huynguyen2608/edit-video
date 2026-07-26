@@ -13,6 +13,24 @@ def test_sqlite_persist_and_claim(tmp_path):
     assert again.get_video("v").edit_status == "done"
 
 
+def test_reset_for_redownload(tmp_path):
+    db = SQLiteStore(tmp_path / "data.db")
+    db.add_discovered("v", "c", "channel", "title", "url", "now")
+    db.set_download_status("v", "downloaded", path=str(tmp_path / "v.mp4"))
+    db.set_edit_status("v", "failed", error="thiếu file")
+    assert db.reset_for_redownload("v") is True
+    row = db.get_video("v")
+    assert row.download_status == "pending"
+    assert row.download_path == ""
+    assert row.edit_status == "pending"
+    raw = next(r for r in db.all_video_rows() if r["video_id"] == "v")
+    assert raw.get("error") in (None, "")   # error xóa trong bản ghi gốc
+    # bền vững sau khi mở lại
+    again = SQLiteStore(tmp_path / "data.db")
+    assert again.get_video("v").download_status == "pending"
+    assert db.reset_for_redownload("khong-ton-tai") is False
+
+
 def test_sqlite_export_excel(tmp_path):
     db = SQLiteStore(tmp_path / "data.db")
     db.add_discovered("v", "c", "channel", "title", "url", "now")

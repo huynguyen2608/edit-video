@@ -42,6 +42,50 @@ class DownloadResult:
     cancelled: bool = False
 
 
+# Từ khóa nhận diện lỗi đọc/giải mã cookie trình duyệt (Chrome app-bound encryption,
+# DPAPI, keyring, file cookie bị khóa…). yt-dlp #10927. -> thử lại KHÔNG dùng cookie.
+_COOKIE_ERROR_HINTS = ("cookie", "dpapi", "decrypt", "keyring", "could not copy",
+                       "failed to load cookies")
+
+
+def _looks_like_cookie_error(exc: BaseException) -> bool:
+    """True nếu lỗi (hoặc nguyên nhân lồng nhau) liên quan đọc/giải mã cookie.
+
+    Duyệt cả chuỗi __cause__/__context__ vì message ngoài cùng của yt-dlp có thể
+    chỉ là 'Failed to decrypt with DPAPI' (không chứa chữ 'cookie').
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}: {cur}")
+        cur = cur.__cause__ or cur.__context__
+    blob = " | ".join(parts).lower()
+    return any(hint in blob for hint in _COOKIE_ERROR_HINTS)
+
+
+# YouTube yêu cầu đăng nhập (khi tải không cookie bị chặn như bot).
+_AUTH_HINTS = ("sign in to confirm", "not a bot", "confirm you", "authentication",
+               "cookies", "login required", "private video", "members-only")
+
+# Hướng dẫn khi cookie trình duyệt không dùng được MÀ YouTube lại đòi đăng nhập.
+COOKIE_HELP = (
+    "Không tải được: cookie trình duyệt không dùng được (Chrome đang MỞ nên khóa file "
+    "cookie, hoặc Chrome mới mã hóa cookie kiểu app-bound), trong khi YouTube đòi đăng "
+    "nhập để xác minh không phải bot.\n\n"
+    "Cách khắc phục (chọn 1):\n"
+    "1) Đóng HẲN Chrome (thoát cả biểu tượng ở khay) rồi bấm Tải lại.\n"
+    "2) Xuất cookie ra file: cài tiện ích 'Get cookies.txt LOCALLY', vào youtube.com "
+    "(đã đăng nhập) rồi xuất; sau đó ở ô Cookie chọn 'file…' và trỏ tới file .txt vừa xuất.\n"
+    "3) Nếu là video công khai: đổi ô Cookie sang '(không dùng)'."
+)
+
+
+def _needs_authentication(exc: BaseException) -> bool:
+    return any(hint in str(exc).lower() for hint in _AUTH_HINTS)
+
+
 class YtDlpDownloader:
     def __init__(self, root_dir: str, fmt: str, cookies_from_browser: str = "",
                  cookies_file: str = ""):
@@ -67,10 +111,15 @@ class YtDlpDownloader:
 
         opts: dict = {
             "format": self.fmt,
-            "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
+            # Đặt tên file theo TIÊU ĐỀ video (dễ đọc) thay vì id; windowsfilenames để
+            # loại ký tự cấm trên Windows, trim_file_name chặn tràn giới hạn 260 ký tự.
+            "outtmpl": str(out_dir / "%(title)s.%(ext)s"),
+            "windowsfilenames": True,
+            "trim_file_name": 120,
             "merge_output_format": "mp4",
-            "writethumbnail": True,
-            "writeinfojson": True,
+            # Chỉ tải đúng 1 file video; KHÔNG kèm thumbnail/.info.json (không dùng tới).
+            "writethumbnail": False,
+            "writeinfojson": False,
             "noprogress": True,
             "quiet": True,
             "no_warnings": True,
@@ -105,10 +154,10 @@ class YtDlpDownloader:
             log.info("Đã dừng tải %s", video_id)
             return DownloadResult(video_id, False, error=str(e), cancelled=True)
         except Exception as e:
-            msg = str(e).lower()
-            locked = "cookie" in msg and any(x in msg for x in ("could not copy", "permission", "locked"))
-            if locked and (self.cookies_from_browser or self.cookies_file):
-                log.warning("Cookie bị khóa; thử lại %s không dùng cookie", video_id)
+            has_cookies = bool(self.cookies_from_browser or self.cookies_file)
+            if has_cookies and _looks_like_cookie_error(e):
+                log.warning("Không đọc được cookie trình duyệt (%s); thử lại %s KHÔNG dùng cookie.",
+                            self.cookies_from_browser or self.cookies_file, video_id)
                 retry = dict(opts)
                 retry.pop("cookiesfrombrowser", None)
                 retry.pop("cookiefile", None)
@@ -117,7 +166,15 @@ class YtDlpDownloader:
                 except DownloadCancelled as cancel_error:
                     return DownloadResult(video_id, False, error=str(cancel_error), cancelled=True)
                 except Exception as retry_error:
+                    # Cookie hỏng + tải-không-cookie bị YouTube chặn (đòi đăng nhập)
+                    # -> trả hướng dẫn rõ ràng thay vì traceback yt-dlp khó hiểu.
+                    if _needs_authentication(retry_error):
+                        log.warning("Tải %s cần cookie nhưng cookie không dùng được.", video_id)
+                        return DownloadResult(video_id, False, error=COOKIE_HELP)
                     e = retry_error
+            elif has_cookies and _needs_authentication(e):
+                # Cookie đọc được nhưng vẫn bị đòi đăng nhập (cookie hết hạn/không đủ quyền).
+                return DownloadResult(video_id, False, error=COOKIE_HELP)
             log.exception("Lỗi tải %s", video_id)
             return DownloadResult(video_id, False, error=str(e))
 
@@ -147,11 +204,25 @@ class YtDlpDownloader:
 
     @staticmethod
     def _locate_output(out_dir: Path, video_id: str, info: dict | None) -> Optional[Path]:
-        # Ưu tiên tên theo id + đuôi phổ biến; fallback quét thư mục.
+        # 1) Đường dẫn thật yt-dlp báo về (chính xác nhất khi tên file theo title).
+        if info:
+            for r in (info.get("requested_downloads") or []):
+                fp = r.get("filepath") or r.get("_filename")
+                if fp and Path(fp).exists():
+                    return Path(fp)
+            fp = info.get("_filename")
+            if fp:
+                merged = Path(fp).with_suffix(".mp4")
+                if merged.exists():
+                    return merged
+                if Path(fp).exists():
+                    return Path(fp)
+        # 2) Tên theo id (các bản tải cũ) + đuôi phổ biến.
         for ext in ("mp4", "mkv", "webm", "mov"):
             cand = out_dir / f"{video_id}.{ext}"
             if cand.exists():
                 return cand
+        # 3) Quét thư mục (mỗi video 1 thư mục riêng nên chỉ còn đúng 1 video).
         vids = [p for p in out_dir.iterdir()
                 if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"} and not p.name.endswith(".part")]
         return vids[0] if vids else None

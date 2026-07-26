@@ -32,3 +32,22 @@ def ensure_dir(path: str | Path) -> Path:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def output_basename(source_path: str | Path, video_id: str) -> str:
+    """Tên file xuất bám theo tên file nguồn; video_id chỉ là phương án dự phòng."""
+    stem = Path(source_path).stem if source_path else ""
+    return safe_name(stem or video_id, max_len=120)
+
+
+def output_video_path(output_dir: str | Path, source_path: str | Path,
+                      video_id: str, kind: str = "full") -> Path:
+    return Path(output_dir) / f"{output_basename(source_path, video_id)}_{kind}.mp4"
+
+
+def existing_output_video_path(output_dir: str | Path, source_path: str | Path,
+                               video_id: str, kind: str = "full") -> Path:
+    """Ưu tiên tên mới theo nguồn, fallback tên video_id của các bản xuất cũ."""
+    new_path = output_video_path(output_dir, source_path, video_id, kind)
+    legacy = Path(output_dir) / f"{safe_name(video_id, 32)}_{kind}.mp4"
+    return new_path if new_path.exists() or not legacy.exists() else legacy

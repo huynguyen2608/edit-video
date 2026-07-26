@@ -5,7 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QThread, QSize
+from PySide6.QtCore import Qt, Signal, QThread, QSize, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFileDialog, QFrame, QGridLayout,
@@ -17,7 +17,9 @@ from PySide6.QtWidgets import (
 from ..editor import export, smart_crop
 from ..editor.stages import Status, fmt_eta
 from ..queue_manager import QueueManager
+from ..paths import existing_output_video_path
 from ..workers.edit_worker import EditWorker
+from .theme import make_columns_resizable
 
 _HEADERS = ["", "Video", "Trạng thái", "Công đoạn / Tiến trình", "Còn lại", "Thao tác"]
 _THUMB = QSize(96, 54)
@@ -173,18 +175,8 @@ class EditQueueWidget(QTableWidget):
         self.setIconSize(_THUMB)
         self.verticalHeader().setDefaultSectionSize(_THUMB.height() + 12)
         self.verticalHeader().hide()
-        h = self.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.Fixed)
-        h.resizeSection(0, 108)
-        h.setSectionResizeMode(1, QHeaderView.Stretch)
-        h.setSectionResizeMode(2, QHeaderView.Fixed)
-        h.resizeSection(2, 105)
-        h.setSectionResizeMode(3, QHeaderView.Fixed)
-        h.resizeSection(3, 275)
-        h.setSectionResizeMode(4, QHeaderView.Fixed)
-        h.resizeSection(4, 70)
-        h.setSectionResizeMode(5, QHeaderView.Fixed)
-        h.resizeSection(5, 105)
+        make_columns_resizable(
+            self, [1.0, 2.8, 1.1, 2.5, 0.8, 1.0], min_width=100)
         self.setAcceptDrops(True)
         self._rows, self._jobs = {}, {}
         self.itemSelectionChanged.connect(self._on_sel)
@@ -265,14 +257,12 @@ class EditQueueWidget(QTableWidget):
         self.setCellWidget(row, 3, cell)
 
     def _set_action(self, row, job):
-        if job.status == Status.FAILED:
-            text, action = "Thử lại", "retry"
-        elif job.status == Status.COMPLETED:
+        if job.status == Status.COMPLETED:
             text, action = "Phát", "play"
         elif job.status in Status.ACTIVE:
-            text, action = "Chi tiết", "select"
+            text, action = "Tạm dừng", "pause_current"
         else:
-            text, action = "Xem", "select"
+            text, action = "Xử lý ngay", "process_now"
         host = QWidget(); box = QHBoxLayout(host)
         box.setContentsMargins(8, 12, 8, 12)
         b = QPushButton(text); b.setFixedHeight(30)
@@ -445,7 +435,7 @@ class VideoInspectorWidget(QFrame):
 
     def _show_output_thumb(self, job):
         self.preview_heading.setText("Xem trước · Video đầu ra")
-        full = os.path.join(job.output_dir, f"{job.video_id}_full.mp4")
+        full = str(existing_output_video_path(job.output_dir, job.source_path, job.video_id, "full"))
         if os.path.exists(full):
             try:
                 png = os.path.join(tempfile.gettempdir(), f"vrs_prev_{job.video_id}.png")
@@ -469,7 +459,8 @@ class VideoInspectorWidget(QFrame):
 
     def _play(self):
         if self._job:
-            full = os.path.join(self._job.output_dir, f"{self._job.video_id}_full.mp4")
+            full = str(existing_output_video_path(
+                self._job.output_dir, self._job.source_path, self._job.video_id, "full"))
             _open(full)
 
     def _open_dir(self):
@@ -480,6 +471,11 @@ class VideoInspectorWidget(QFrame):
 
 
 class QueueTab(QWidget):
+    # Notify the main window whenever queue state persisted in the DB changes.
+    data_changed = Signal()
+    # Tiến trình biên tập (video_id, %, eta) -> để tab Tải hiện % xử lý.
+    edit_progress = Signal(str, int, str)
+
     def __init__(self, cfg, db, device: str = "auto"):
         super().__init__()
         self.cfg, self.db, self.device = cfg, db, device
@@ -534,8 +530,22 @@ class QueueTab(QWidget):
         self.filter.currentIndexChanged.connect(self._apply_filter); row.addWidget(self.filter)
         self.selected_label = QLabel(); self.selected_label.hide(); row.addWidget(self.selected_label)
         row.addStretch(1)
-        self.btn_import = QPushButton("+ Nhập video"); self.btn_import.clicked.connect(self.on_import)
+        self.btn_remove_selected = QPushButton("Xóa đã chọn")
+        self.btn_remove_selected.setToolTip(
+            "Giữ Ctrl hoặc Shift để chọn nhiều dòng, sau đó xóa khỏi hàng đợi")
+        self.btn_remove_selected.clicked.connect(self.on_remove_selected)
+        self.btn_remove_selected.setEnabled(False)
+        self.btn_remove_selected.hide()
+        row.addWidget(self.btn_remove_selected)
+        self.btn_import = QPushButton("+ Nhập video")
+        self.btn_import.setToolTip("Chọn một hoặc nhiều file video để thêm vào hàng đợi")
+        self.btn_import.clicked.connect(self.on_import)
         row.addWidget(self.btn_import)
+        self.btn_import_folder = QPushButton("+ Nhập thư mục")
+        self.btn_import_folder.setToolTip(
+            "Thêm toàn bộ video trong một thư mục và các thư mục con vào hàng đợi")
+        self.btn_import_folder.clicked.connect(self.on_import_folder)
+        row.addWidget(self.btn_import_folder)
         self.btn_rebuild = QPushButton("Cập nhật danh sách")
         self.btn_rebuild.setToolTip("Nạp lại các video đã tải vào hàng đợi")
         self.btn_rebuild.clicked.connect(self.on_rebuild_queue)
@@ -549,7 +559,6 @@ class QueueTab(QWidget):
         menu = QMenu(more)
         for text, fn in (("Thử lại tất cả video lỗi", self.on_retry),
                          ("Xóa video đã hoàn thành", self.on_remove_completed),
-                         ("Xóa video đang chọn", self.on_remove_selected),
                          ("Mở thư mục video nguồn", self.on_open_source),
                          ("Mở thư mục đầu ra", self.on_open_output)):
             menu.addAction(QAction(text, menu, triggered=fn))
@@ -561,7 +570,7 @@ class QueueTab(QWidget):
     def refresh(self) -> None:
         jobs = self.qm.jobs()
         self.queue.set_jobs(jobs); self.dash.update_stats(self.qm.dashboard()); self._apply_filter()
-        if self._thumb: self._thumb.stop()
+        self._stop_thumb()
         pairs = [(j.video_id, j.source_path) for j in jobs if j.source_path]
         if pairs:
             self._thumb = ThumbnailWorker(pairs, self._cache)
@@ -594,10 +603,32 @@ class QueueTab(QWidget):
         n = len(self.queue.selected_ids())
         self.selected_label.setText(f"Đã chọn {n} video")
         self.selected_label.setVisible(n > 1)
+        self.btn_remove_selected.setText(f"Xóa đã chọn ({n})")
+        self.btn_remove_selected.setEnabled(n > 0)
+        self.btn_remove_selected.setVisible(n > 0)
 
-    def _on_paths_dropped(self, paths):
+    def _on_paths_dropped(self, paths, auto_start: bool = False):
         result = self.qm.import_paths(paths); self.refresh()
-        QMessageBox.information(self, "Nhập video", f"Đã thêm {result['added']} video; bỏ qua {result['skipped_done']} video đã hoàn thành.")
+        self.data_changed.emit()
+        total = int(result.get("total", 0))
+        added = int(result.get("added", 0))
+        waiting = len(result.get("eligible", []))
+        completed = int(result.get("skipped_done", 0))
+        if total == 0:
+            QMessageBox.information(
+                self, "Nhập video",
+                "Không tìm thấy video hợp lệ trong nội dung đã chọn.")
+            return
+        if auto_start and waiting:
+            # Dùng nguyên luồng hàng đợi cũ (EditWorker + FIFO), chỉ tự kích
+            # hoạt sau khi import folder thay vì yêu cầu bấm thêm một lần.
+            QTimer.singleShot(0, self.on_start)
+        QMessageBox.information(
+            self, "Nhập video",
+            f"Đã tìm thấy {total} video.\n"
+            f"• Mới thêm: {added}\n"
+            f"• Có trong hàng đợi: {waiting}\n"
+            f"• Đã hoàn thành, được bỏ qua: {completed}")
 
     def _on_job_selected(self, vid):
         self._current = vid
@@ -610,28 +641,39 @@ class QueueTab(QWidget):
         job = next((j for j in self.qm.jobs() if j.video_id == vid), None)
         if job: self.preview.set_job(job)
         if action == "retry": self._retry_one(vid)
+        elif action == "process_now": self._process_now(vid)
+        elif action == "pause_current": self.on_stop()
         elif action == "play" and job:
-            _open(os.path.join(job.output_dir, f"{job.video_id}_full.mp4"))
+            _open(str(existing_output_video_path(job.output_dir, job.source_path, job.video_id, "full")))
 
     def _retry_one(self, vid):
         self.db.set_edit_status(vid, "pending")
         self.db.update_job(vid, job_status=Status.WAITING, stage="", progress=0, error=None)
         self.refresh()
+        self.data_changed.emit()
+        if self.cfg.editor.auto_edit_after_download:
+            self.on_start()
 
     def _primary_action(self):
         if not self._worker or not self._worker.isRunning(): self.on_start()
-        elif self.btn_primary.text() == "Tạm dừng": self.on_pause()
-        else: self.on_resume()
+        elif self._worker.is_paused(): self.on_resume()
+        else: self.on_pause()
 
-    def on_start(self):
+    def on_start(self, preferred_id=None):
         if self._worker and self._worker.isRunning(): return
-        self._worker = EditWorker(self.cfg, self.db, device=self.device); w = self._worker
+        if not self.qm.next_pending(preferred_id):
+            self.refresh()
+            return
+        self._worker = EditWorker(
+            self.cfg, self.db, device=self.device, preferred_id=preferred_id); w = self._worker
         w.status_changed.connect(self._on_status); w.stage_changed.connect(self._on_stage)
         w.progress_changed.connect(self._on_progress); w.job_completed.connect(self._on_completed)
         w.job_failed.connect(self._on_failed); w.job_cancelled.connect(self._on_cancelled)
         w.log.connect(self._on_log)
         w.queue_finished.connect(self._on_finished)
-        self.btn_primary.setText("Tạm dừng"); self.btn_stop.show(); self.dash.set_running(True); w.start()
+        self.btn_primary.setText("Tạm dừng sau video này")
+        self.btn_stop.setText("Tạm dừng video")
+        self.btn_stop.show(); self.dash.set_running(True); w.start()
 
     def on_pause(self):
         if self._worker:
@@ -639,32 +681,86 @@ class QueueTab(QWidget):
 
     def on_resume(self):
         if self._worker:
-            self._worker.resume(); self.btn_primary.setText("Tạm dừng"); self.dash.set_running(True)
+            self._worker.resume()
+            self.btn_primary.setText("Tạm dừng sau video này")
+            self.dash.set_running(True)
+
+    def _process_now(self, vid):
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(
+                self, "Video khác đang xử lý",
+                "Hãy tạm dừng video hiện tại trước khi chạy video đã chọn.")
+            return
+        if self.qm.prepare_for_run(vid):
+            self.refresh()
+            self.data_changed.emit()
+            self.on_start(preferred_id=vid)
 
     def on_stop(self):
-        if self._worker and QMessageBox.question(
-                self, "Dừng video hiện tại",
-                "Dừng ngay FFmpeg và video đang xử lý?\n\n"
-                "File đầu ra chưa hoàn chỉnh sẽ được xóa. Video sẽ được đưa về hàng đợi để có thể chạy lại.") == QMessageBox.Yes:
-            self._worker.request_stop()
-            self.btn_stop.setText("Đang dừng…"); self.btn_stop.setEnabled(False)
-            self.dash.state.setText("● Đang dừng video hiện tại")
+        if not (self._worker and self._worker.isRunning()):
+            return
+        selected = self.queue.selected_id()
+        # Nếu đang chọn một video KHÁC video đang chạy -> ưu tiên xử lý video đó tiếp theo.
+        preferred = selected if selected and selected != self._current else None
+        detail = ("Dừng ngay video đang xử lý và chuyển sang trạng thái 'Tạm dừng' "
+                  "(không tự chạy lại; bấm 'Xử lý ngay' để tiếp tục sau).\n\n"
+                  + ("Tiếp tục với video bạn đang chọn." if preferred
+                     else "Nếu còn video khác đang chờ sẽ xử lý tiếp; hết thì dừng."))
+        if QMessageBox.question(self, "Tạm dừng video hiện tại", detail,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self._worker.skip_current(preferred_next=preferred)
+            self.dash.state.setText("● Đang chuyển sang video khác…")
             self.dash.state.setStyleSheet("color:#b45309;")
 
     def on_retry(self):
         count = len(self.qm.retry_failed()); self.refresh()
+        self.data_changed.emit()
         QMessageBox.information(self, "Thử lại", f"Đã đưa {count} video lỗi về trạng thái chờ.")
+        if count and self.cfg.editor.auto_edit_after_download:
+            self.on_start()
 
     def on_import(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Chọn video", "", "Video (*.mp4 *.mkv *.mov *.webm *.avi *.m4v)")
-        folder = "" if files else QFileDialog.getExistingDirectory(self, "Hoặc chọn thư mục")
-        paths = files or ([folder] if folder else [])
-        if paths: self._on_paths_dropped(paths)
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Chọn video",
+            "",
+            "Video (*.mp4 *.mkv *.mov *.webm *.avi *.m4v)",
+        )
+        if files:
+            self._on_paths_dropped(files)
+
+    def on_import_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Chọn thư mục chứa danh sách video",
+            "",
+            QFileDialog.ShowDirsOnly,
+        )
+        if folder:
+            self._on_paths_dropped([folder], auto_start=True)
 
     def on_remove_selected(self):
         ids = self.queue.selected_ids()
-        if ids and QMessageBox.question(self, "Xóa khỏi hàng đợi", f"Xóa {len(ids)} video đang chọn khỏi hàng đợi?") == QMessageBox.Yes:
-            self.qm.remove_from_queue(ids); self.refresh()
+        jobs = {j.video_id: j for j in self.qm.jobs()}
+        removable = [vid for vid in ids if vid in jobs and jobs[vid].status not in Status.ACTIVE]
+        active = len(ids) - len(removable)
+        if not removable:
+            if active:
+                QMessageBox.information(
+                    self, "Không thể xóa",
+                    "Video đang xử lý không thể xóa. Hãy tạm dừng video trước.")
+            return
+        detail = f"Xóa {len(removable)} video đang chọn khỏi hàng đợi?"
+        if active:
+            detail += f"\n\nBỏ qua {active} video đang được xử lý."
+        if QMessageBox.question(
+                self, "Xóa khỏi hàng đợi", detail,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self.qm.remove_from_queue(removable)
+            self._current = None
+            self.preview.clear_job()
+            self.refresh()
+            self.data_changed.emit()
 
     def on_remove_completed(self):
         ids = [j.video_id for j in self.qm.jobs() if j.status == Status.COMPLETED]
@@ -707,6 +803,7 @@ class QueueTab(QWidget):
         if status == Status.PREPARING and vid not in self._starts: self._starts[vid] = time.time()
         self.dash.update_stats(self.qm.dashboard())
         if vid == self._current: self.preview.set_status(status)
+        self.data_changed.emit()
 
     def _on_stage(self, vid, stage):
         self.queue.set_stage(vid, stage)
@@ -715,17 +812,20 @@ class QueueTab(QWidget):
     def _on_progress(self, vid, pct, eta):
         import time
         self.queue.set_progress(vid, pct, eta)
+        self.edit_progress.emit(vid, int(pct), eta or "")
         if vid == self._current:
             self.preview.set_progress(pct, eta, fmt_eta(time.time() - self._starts.get(vid, time.time())))
 
     def _on_completed(self, vid):
         self.dash.update_stats(self.qm.dashboard())
+        self.data_changed.emit()
         if vid == self._current:
             job = next((j for j in self.qm.jobs() if j.video_id == vid), None)
             if job: self.preview.set_job(job)
 
     def _on_failed(self, vid, err):
         self.dash.update_stats(self.qm.dashboard())
+        self.data_changed.emit()
         if vid == self._current:
             self.preview.error.setText("Lỗi: " + err); self.preview.error.show()
             self.preview.append_log(f"[LỖI] {err}")
@@ -734,6 +834,7 @@ class QueueTab(QWidget):
         if vid == self._current:
             self.preview.error.hide()
         self.refresh()
+        self.data_changed.emit()
 
     def _on_log(self, vid, msg):
         if vid == self._current: self.preview.append_log(msg)
@@ -742,8 +843,24 @@ class QueueTab(QWidget):
         self.btn_primary.setText("Bắt đầu hàng đợi")
         self.btn_stop.setText("Dừng"); self.btn_stop.hide(); self.btn_stop.setEnabled(True)
         self.dash.set_running(False); self.refresh()
+        self.data_changed.emit()
+
+    def _stop_thumb(self) -> None:
+        """Dừng và CHỜ luồng thumbnail kết thúc trước khi bỏ tham chiếu.
+        Thiếu wait() -> QThread bị hủy khi còn chạy -> Qt abort cả ứng dụng."""
+        t = self._thumb
+        self._thumb = None
+        if t is not None:
+            t.stop()
+            if not t.wait(5000):
+                t.terminate(); t.wait(1000)
 
     def shutdown(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.request_stop(); self._worker.wait(3000)
-        if self._thumb: self._thumb.stop()
+        w = self._worker
+        if w and w.isRunning():
+            w.request_stop()
+            # ffmpeg bị kill trong ~0.1s; chờ pipeline nhả. Nếu còn kẹt
+            # (vd. đang nạp model Whisper) mới buộc dừng để tránh crash lúc thoát.
+            if not w.wait(10000):
+                w.terminate(); w.wait(2000)
+        self._stop_thumb()

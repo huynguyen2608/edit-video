@@ -1,0 +1,406 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1784956929439,
+  "projectRoot": "C:\\Users\\sonth\\Desktop\\edit-video",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": "snake_case",
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "app",
+      "docs",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "app": {
+      "path": "app",
+      "purpose": "Application code",
+      "fileCount": 10,
+      "lastAccessed": 1784956929408,
+      "keyFiles": [
+        "config.py",
+        "logging_setup.py",
+        "paths.py",
+        "preflight.py",
+        "presets.py"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 1,
+      "lastAccessed": 1784956929410,
+      "keyFiles": [
+        "tab-bien-tap.md"
+      ]
+    },
+    "logs": {
+      "path": "logs",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1784956929411,
+      "keyFiles": [
+        "app.log"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 18,
+      "lastAccessed": 1784956929412,
+      "keyFiles": [
+        "e2e_auto_edit.py",
+        "e2e_edit_folder.py",
+        "e2e_reframe_crop.py",
+        "e2e_render.py",
+        "e2e_subtitle.py"
+      ]
+    },
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1784956929414,
+      "keyFiles": [
+        "run.cpython-312.pyc",
+        "run.cpython-314.pyc"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "app\\ui\\main_window.py",
+      "accessCount": 72,
+      "lastAccessed": 1784969504621,
+      "type": "file"
+    },
+    {
+      "path": "app\\ui\\queue_tab.py",
+      "accessCount": 15,
+      "lastAccessed": 1784969138252,
+      "type": "file"
+    },
+    {
+      "path": "app\\workers\\edit_worker.py",
+      "accessCount": 13,
+      "lastAccessed": 1784968671658,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\export.py",
+      "accessCount": 10,
+      "lastAccessed": 1784966063328,
+      "type": "file"
+    },
+    {
+      "path": "app\\downloader\\downloader.py",
+      "accessCount": 9,
+      "lastAccessed": 1784963184047,
+      "type": "file"
+    },
+    {
+      "path": "app\\ui\\theme.py",
+      "accessCount": 7,
+      "lastAccessed": 1784969478054,
+      "type": "file"
+    },
+    {
+      "path": "app\\workers\\jobs.py",
+      "accessCount": 6,
+      "lastAccessed": 1784960990463,
+      "type": "file"
+    },
+    {
+      "path": "app\\store.py",
+      "accessCount": 5,
+      "lastAccessed": 1784962537944,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\pipeline.py",
+      "accessCount": 5,
+      "lastAccessed": 1784964011765,
+      "type": "file"
+    },
+    {
+      "path": "app\\queue_manager.py",
+      "accessCount": 4,
+      "lastAccessed": 1784962744089,
+      "type": "file"
+    },
+    {
+      "path": "tests\\test_misc.py",
+      "accessCount": 4,
+      "lastAccessed": 1784964054823,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\video_ops.py",
+      "accessCount": 4,
+      "lastAccessed": 1784966045664,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\audio_ops.py",
+      "accessCount": 4,
+      "lastAccessed": 1784967228034,
+      "type": "file"
+    },
+    {
+      "path": "app\\downloader\\scheduler.py",
+      "accessCount": 3,
+      "lastAccessed": 1784960485859,
+      "type": "file"
+    },
+    {
+      "path": "run_tests.py",
+      "accessCount": 3,
+      "lastAccessed": 1784960743738,
+      "type": "file"
+    },
+    {
+      "path": "app\\config.py",
+      "accessCount": 3,
+      "lastAccessed": 1784966013601,
+      "type": "file"
+    },
+    {
+      "path": "config.example.yaml",
+      "accessCount": 3,
+      "lastAccessed": 1784966515692,
+      "type": "file"
+    },
+    {
+      "path": "tests\\test_queue.py",
+      "accessCount": 3,
+      "lastAccessed": 1784968712120,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\stages.py",
+      "accessCount": 2,
+      "lastAccessed": 1784957039129,
+      "type": "directory"
+    },
+    {
+      "path": "app\\editor\\edit_service.py",
+      "accessCount": 2,
+      "lastAccessed": 1784957089985,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\edge_tts_service.py",
+      "accessCount": 2,
+      "lastAccessed": 1784957337817,
+      "type": "file"
+    },
+    {
+      "path": "run.py",
+      "accessCount": 2,
+      "lastAccessed": 1784957670339,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\cancel.py",
+      "accessCount": 2,
+      "lastAccessed": 1784958061732,
+      "type": "file"
+    },
+    {
+      "path": "app\\sqlite_store.py",
+      "accessCount": 2,
+      "lastAccessed": 1784960401610,
+      "type": "file"
+    },
+    {
+      "path": "tests\\test_sqlite_store.py",
+      "accessCount": 2,
+      "lastAccessed": 1784960747546,
+      "type": "file"
+    },
+    {
+      "path": "app/ui/main_window.py",
+      "accessCount": 2,
+      "lastAccessed": 1784963297907,
+      "type": "directory"
+    },
+    {
+      "path": "app\\paths.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957027935,
+      "type": "file"
+    },
+    {
+      "path": "app\\presets.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957030076,
+      "type": "file"
+    },
+    {
+      "path": "app\\preflight.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957030651,
+      "type": "file"
+    },
+    {
+      "path": "requirements.txt",
+      "accessCount": 1,
+      "lastAccessed": 1784957031423,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\smart_crop.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957040035,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\analyze.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957040521,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\local_source.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957041122,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\subtitles.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957041832,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\transcribe.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957042318,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\translate.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957042711,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\preview.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957048146,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor\\fingerprint.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957049285,
+      "type": "file"
+    },
+    {
+      "path": "app\\logging_setup.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957052018,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1784957052224,
+      "type": "file"
+    },
+    {
+      "path": "docs\\tab-bien-tap.md",
+      "accessCount": 1,
+      "lastAccessed": 1784957052390,
+      "type": "file"
+    },
+    {
+      "path": "app\\downloader\\monitor.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957056988,
+      "type": "file"
+    },
+    {
+      "path": "app\\report.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957058564,
+      "type": "file"
+    },
+    {
+      "path": "app\\editor",
+      "accessCount": 1,
+      "lastAccessed": 1784957094992,
+      "type": "directory"
+    },
+    {
+      "path": "app/editor/stages.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957144563,
+      "type": "directory"
+    },
+    {
+      "path": "app/config.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957395598,
+      "type": "directory"
+    },
+    {
+      "path": "app/editor/local_source.py",
+      "accessCount": 1,
+      "lastAccessed": 1784957560621,
+      "type": "directory"
+    },
+    {
+      "path": "config.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1784957670728,
+      "type": "file"
+    },
+    {
+      "path": "app\\downloader\\reconcile.py",
+      "accessCount": 1,
+      "lastAccessed": 1784960439194,
+      "type": "file"
+    },
+    {
+      "path": "tests\\test_reconcile.py",
+      "accessCount": 1,
+      "lastAccessed": 1784960681298,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

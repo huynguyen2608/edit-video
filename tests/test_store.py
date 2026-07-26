@@ -87,6 +87,20 @@ def test_download_transition_does_not_overwrite_completed(tmp_path):
     assert db.get_video("race").download_status == "downloaded"
 
 
+def test_remove_incomplete_remote_keeps_local_and_downloaded(tmp_path):
+    db = ExcelStore(tmp_path / "data.xlsx")
+    for video_id, status in (
+        ("pending", "pending"), ("paused", "paused"), ("failed", "failed"),
+        ("cancelling", "cancelling"), ("done", "downloaded"),
+    ):
+        db.add_discovered(video_id, "UC", "C", video_id, "url", "p")
+        db.set_download_status(video_id, status, path="done.mp4" if status == "downloaded" else None)
+    db.add_local_video("local_keep", "Local", "Local", str(tmp_path / "local.mp4"))
+
+    assert db.remove_incomplete_remote_videos() == 4
+    assert {row.video_id for row in db.all_videos()} == {"done", "local_keep"}
+
+
 def test_persist_and_reload(tmp_path):
     """Ghi -> mở lại từ FILE Excel phải khôi phục đúng trạng thái (nhiều sheet)."""
     path = tmp_path / "data.xlsx"

@@ -71,6 +71,7 @@ def test_export_burns_subtitle_with_style():
     fc = " ".join(export.build_command(e, ri, "out.mp4"))
     assert "subtitles=" in fc and "force_style=" in fc
     assert "Alignment=2" in fc and "FontSize=28" in fc
+    assert "original_size=1080x1920" in fc
     assert "D\\\\:/out/v/v.srt" in fc        # path escape (double-colon) đúng
 
 

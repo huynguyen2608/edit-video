@@ -64,3 +64,13 @@ def test_local_video_marked_downloaded(tmp_path):
     row = store.pending_edits()
     assert len(row) == 1 and row[0].download_status == "downloaded"
     assert row[0].download_path.endswith("x.mp4")
+
+
+def test_folder_watcher_scan_does_not_retry_failed_video(tmp_path):
+    vids = tmp_path / "watch"; vids.mkdir(); _mk(vids / "new.mp4")
+    store = ExcelStore(tmp_path / "data.xlsx")
+    first = ls.ingest_folder(store, vids)
+    vid = first["eligible"][0]
+    store.set_edit_status(vid, "failed", error="bad")
+    ls.ingest_folder(store, vids, retry_failed=False)
+    assert store.get_video(vid).edit_status == "failed"

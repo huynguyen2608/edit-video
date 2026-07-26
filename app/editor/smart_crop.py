@@ -26,20 +26,27 @@ class Dimensions:
     width: int
     height: int
     duration: float
+    fps: float = 0.0
 
 
 def probe_dimensions(path: str, ffprobe: str = "ffprobe") -> Dimensions:
     """Đọc kích thước + thời lượng bằng ffprobe."""
     cmd = [
         ffprobe, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height:format=duration",
+        "-show_entries", "stream=width,height,avg_frame_rate:format=duration",
         "-of", "json", path,
     ]
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     data = json.loads(out)
     st = data["streams"][0]
     dur = float(data.get("format", {}).get("duration", 0.0) or 0.0)
-    return Dimensions(int(st["width"]), int(st["height"]), dur)
+    rate = str(st.get("avg_frame_rate") or "0/1")
+    try:
+        num, den = rate.split("/", 1)
+        fps = float(num) / float(den) if float(den) else 0.0
+    except (ValueError, ZeroDivisionError):
+        fps = 0.0
+    return Dimensions(int(st["width"]), int(st["height"]), dur, fps)
 
 
 def has_audio(path: str, ffprobe: str = "ffprobe") -> bool:
@@ -66,6 +73,19 @@ def audio_codec(path: str, ffprobe: str = "ffprobe") -> str:
         return out.stdout.strip().lower()
     except Exception:
         return ""
+
+
+def audio_channels(path: str, ffprobe: str = "ffprobe") -> int:
+    """Số kênh của track audio đầu tiên; không đọc được thì coi là stereo."""
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=channels", "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+        )
+        return max(1, int((out.stdout or "").strip()))
+    except Exception:
+        return 2
 
 
 def grab_frame(path: str, out_png: str, at_seconds: float = 1.0,

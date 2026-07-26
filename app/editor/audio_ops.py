@@ -3,10 +3,12 @@ filter_complex audio để export ghép vào lệnh ffmpeg cuối.
 
 Ưu tiên nguồn audio đích:  voiceover  >  vocals (đã tách giọng)  >  audio gốc.
 Nếu có nhạc thay thế -> trộn xuống nền ở `music_volume`.
-Tempo audio = editor.speed * audio.audio_speed:
+Tempo audio:
   - editor.speed áp cho CẢ video (setpts) lẫn audio -> giữ đồng bộ hình/tiếng.
   - audio.audio_speed là tinh chỉnh tempo RIÊNG cho audio (đổi dấu vân tay âm thanh);
     để = 1.0 nếu chỉ muốn đổi tốc độ chung mà không lệch tiếng.
+  - KHI CÓ LỒNG TIẾNG (voiceover/TTS): BỎ QUA audio_speed, chỉ dùng editor.speed để
+    giọng đọc khớp đúng tốc độ video, tránh lệch lời.
 
 Cảnh báo thực tế:
 - separate_speech (Demucs) tách "vocals" vs "nhạc": video nói trên nền nhạc thì được
@@ -164,9 +166,74 @@ def pitch_speed_filters(pitch_semitones: int, tempo_factor: float = 1.0) -> list
     return filters
 
 
+def voice_enhancement_filters(
+        audio_cfg, audio_channels: int = 2) -> tuple[list[str], list[str]]:
+    """Dựng bộ lọc lời thoại nhẹ: (trước khi trộn nhạc, sau khi trộn nhạc)."""
+    pre: list[str] = []
+    hp = int(getattr(audio_cfg, "highpass_hz", 0) or 0)
+    lp = int(getattr(audio_cfg, "lowpass_hz", 0) or 0)
+    noise = max(0, min(20, int(
+        getattr(audio_cfg, "noise_reduction_percent", 0) or 0)))
+    if hp:
+        pre.append(f"highpass=f={hp}")
+    if lp:
+        pre.append(f"lowpass=f={lp}")
+    if noise:
+        pre.append(f"afftdn=nr={noise}:tn=1")
+
+    bass = float(getattr(audio_cfg, "bass_db", 0.0) or 0.0)
+    mid = float(getattr(audio_cfg, "mid_db", 0.0) or 0.0)
+    treble = float(getattr(audio_cfg, "treble_db", 0.0) or 0.0)
+    if abs(bass) > 1e-6:
+        pre.append(f"bass=g={_fmt(bass)}:f=120:w=0.5")
+    if abs(mid) > 1e-6:
+        pre.append(f"equalizer=f=1500:t=q:w=1:g={_fmt(mid)}")
+    if abs(treble) > 1e-6:
+        pre.append(f"treble=g={_fmt(treble)}:f=8000:w=0.5")
+
+    deesser = max(0.0, min(4.0, float(
+        getattr(audio_cfg, "deesser_db", 0.0) or 0.0)))
+    if deesser:
+        pre.append(f"deesser=i={_fmt(deesser / 4.0)}")
+
+    if bool(getattr(audio_cfg, "compressor_enabled", False)):
+        threshold_db = float(getattr(audio_cfg, "compressor_threshold_db", -18.0))
+        threshold = 10 ** (threshold_db / 20.0)
+        ratio = max(1.0, min(3.0, float(
+            getattr(audio_cfg, "compressor_ratio", 2.0))))
+        attack = max(5.0, min(20.0, float(
+            getattr(audio_cfg, "compressor_attack_ms", 10.0))))
+        release = max(80.0, min(150.0, float(
+            getattr(audio_cfg, "compressor_release_ms", 100.0))))
+        pre.append(
+            "acompressor="
+            f"threshold={threshold:.6f}:ratio={_fmt(ratio)}:"
+            f"attack={_fmt(attack)}:release={_fmt(release)}")
+
+    gain = max(-1.0, min(1.0, float(
+        getattr(audio_cfg, "gain_db", 0.0) or 0.0)))
+    if abs(gain) > 1e-6:
+        pre.append(f"volume={_fmt(gain)}dB")
+
+    master: list[str] = []
+    ceiling = max(-2.0, min(-0.5, float(
+        getattr(audio_cfg, "limiter_ceiling_db", -1.0))))
+    if bool(getattr(audio_cfg, "loudness_enabled", False)):
+        attr = "loudness_mono_lufs" if int(audio_channels or 2) == 1 else "loudness_stereo_lufs"
+        fallback = -19.0 if attr == "loudness_mono_lufs" else -16.0
+        target = max(-21.0, min(-14.0, float(
+            getattr(audio_cfg, attr, fallback))))
+        master.append(
+            f"loudnorm=I={_fmt(target)}:TP={_fmt(ceiling)}:LRA=11")
+    if bool(getattr(audio_cfg, "limiter_enabled", False)):
+        master.append(f"alimiter=limit={10 ** (ceiling / 20.0):.6f}")
+    return pre, master
+
+
 def build_audio_filtergraph(cfg, *, original: str = "0:a",
                             voiceover: str | None = None, vocals: str | None = None,
-                            music: str | None = None, out_label: str = "aout") -> str:
+                            music: str | None = None, out_label: str = "aout",
+                            audio_channels: int = 2) -> str:
     """Dựng filter_complex audio, kết thúc bằng [out_label].
 
     Tham số voiceover/vocals/music là NHÃN luồng ffmpeg (vd "3:a"), None = không dùng.
@@ -176,7 +243,13 @@ def build_audio_filtergraph(cfg, *, original: str = "0:a",
     base = voiceover or vocals or original or music
     if base is None:
         raise ValueError("build_audio_filtergraph: không có nguồn audio nào")
-    stmts: list[str] = [f"[{base}]aresample={_SR}[abase]"]
+    # Tinh chỉnh áp dụng cho nguồn âm thanh CHÍNH cuối cùng: audio gốc, vocals
+    # đã tách, Edge TTS hoặc file voiceover.
+    enhance = bool(getattr(a, "enhance_original_voice", False))
+    pre_filters, master_filters = (
+        voice_enhancement_filters(a, audio_channels) if enhance else ([], []))
+    stmts: list[str] = [
+        f"[{base}]{','.join([f'aresample={_SR}', *pre_filters])}[abase]"]
     cur = "abase"
     if music and music != base:
         if getattr(a, "duck_music", False):
@@ -191,11 +264,16 @@ def build_audio_filtergraph(cfg, *, original: str = "0:a",
             # normalize=0 để giọng giữ nguyên, nhạc đã hạ theo music_volume.
             stmts.append(f"[{cur}][amus]amix=inputs=2:duration=first:normalize=0[amix]")
         cur = "amix"
-    tempo_factor = max(1e-6, float(cfg.speed)) * max(1e-6, float(a.audio_speed))
+    # Lồng tiếng (TTS/file thu sẵn) PHẢI khớp đúng tốc độ VIDEO để không lệch lời, nên
+    # chỉ áp cfg.speed (bỏ qua audio_speed vốn dùng để đổi vân tay). Không có lồng tiếng
+    # mới áp thêm audio_speed cho phần audio gốc/nhạc.
+    aspeed = 1.0 if voiceover else max(1e-6, float(a.audio_speed))
+    tempo_factor = max(1e-6, float(cfg.speed)) * aspeed
     # apad ở cuối: nếu audio (voiceover/nhạc) NGẮN hơn video thì đệm im lặng cho đủ,
     # tránh -shortest cắt cụt phần hình còn lại.
-    tail = pitch_speed_filters(a.pitch_shift_semitones, tempo_factor) or ["anull"]
-    tail = tail + ["apad"]
+    tail = pitch_speed_filters(a.pitch_shift_semitones, tempo_factor)
+    tail = tail + master_filters
+    tail = (tail or ["anull"]) + ["apad"]
     stmts.append(f"[{cur}]{','.join(tail)}[{out_label}]")
     return ";".join(stmts)
 
@@ -206,5 +284,6 @@ def needs_audio_filtergraph(cfg, *, has_voiceover: bool, has_vocals: bool,
     a = cfg.audio
     tempo_factor = max(1e-6, float(cfg.speed)) * max(1e-6, float(a.audio_speed))
     return bool(has_voiceover or has_vocals or has_music
+                or getattr(a, "enhance_original_voice", False)
                 or a.pitch_shift_semitones
                 or abs(tempo_factor - 1.0) > 1e-6)

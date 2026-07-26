@@ -101,16 +101,39 @@ class QueueManager:
         """Kéo-thả / thêm file&folder vào Queue (dedup, bỏ video đã hoàn thành)."""
         return local_source.ingest_paths(self.db, paths)
 
-    def next_pending(self) -> str | None:
+    def next_pending(self, preferred_id: str | None = None, exclude=None) -> str | None:
         """Video kế tiếp CẦN xử lý (Waiting/Interrupted), theo thứ tự thêm (FIFO).
-        KHÔNG tự chạy lại Failed (chỉ chạy lại khi bấm Retry)."""
+        KHÔNG tự chạy lại Failed (chỉ chạy lại khi bấm Retry).
+        exclude: bộ id bỏ qua tạm thời (video vừa tạm dừng, chưa xử lý lại ngay)."""
+        skip = set(exclude or ())
         rows = sorted(self.db.all_video_rows(), key=lambda r: (r.get("added_at") or ""))
+        if preferred_id and preferred_id not in skip:
+            preferred = next((r for r in rows if r.get("video_id") == preferred_id), None)
+            if (preferred and preferred.get("download_status") == "downloaded"
+                    and preferred.get("edit_status") != "done"
+                    and display_status(preferred) in (Status.WAITING, Status.INTERRUPTED)):
+                return preferred_id
         for r in rows:
+            if r.get("video_id") in skip:
+                continue
             if r.get("download_status") != "downloaded" or r.get("edit_status") == "done":
                 continue
             if display_status(r) in (Status.WAITING, Status.INTERRUPTED):
                 return r.get("video_id")
         return None
+
+    def prepare_for_run(self, video_id: str) -> bool:
+        """Move a user-selected job into a state that can run immediately."""
+        row = next((r for r in self.db.all_video_rows()
+                    if r.get("video_id") == video_id), None)
+        if (not row or row.get("download_status") != "downloaded"
+                or row.get("edit_status") == "done"
+                or display_status(row) in Status.ACTIVE):
+            return False
+        self.db.set_edit_status(video_id, "pending", error=None)
+        self.db.update_job(video_id, job_status=Status.WAITING, stage="", progress=0,
+                           error=None)
+        return True
 
     def runnable_ids(self) -> list[str]:
         """Id CẦN xử lý: đã tải, chưa 'done', trạng thái Waiting/Interrupted/Failed."""

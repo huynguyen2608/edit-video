@@ -19,17 +19,22 @@ class ScanWorker(QThread):
     log = Signal(str)
     status = Signal(str, str, str)         # (video_id, field, value)
     progress = Signal(str, float, str)     # (video_id, percent, note)
+    downloaded = Signal(str)               # (video_id) tải xong -> UI đẩy sang edit
     done = Signal(dict)
 
-    def __init__(self, cfg: AppConfig, db: ExcelStore):
+    def __init__(self, cfg: AppConfig, db: ExcelStore, discover_only: bool = False,
+                 reconcile: bool = False):
         super().__init__()
         self.cfg = cfg
         self.db = db
+        self.discover_only = discover_only
+        self.reconcile = reconcile
         self.service = ScanService(
             self.cfg, self.db,
             on_log=self.log.emit,
             on_status=lambda a, b, c: self.status.emit(a, b, c),
             on_progress=lambda a, b, c: self.progress.emit(a, b, c),
+            on_downloaded=self.downloaded.emit,
         )
 
     def cancel_video(self, video_id: str) -> None:
@@ -39,7 +44,8 @@ class ScanWorker(QThread):
         self.service.cancel_all_downloads()
 
     def run(self) -> None:
-        stats = self.service.scan_once()
+        stats = self.service.scan_once(discover_only=self.discover_only,
+                                       reconcile=self.reconcile)
         self.done.emit(stats)
 
 
@@ -47,6 +53,7 @@ class ManualDownloadWorker(QThread):
     """Tải THỦ CÔNG 1 video theo URL/ID (chạy nền). Ép tải kể cả video đang kẹt/failed."""
     log = Signal(str)
     status = Signal(str, str, str)  # video_id, field, value
+    progress = Signal(str, float, str)  # (video_id, %, note)
     done = Signal(dict)   # {ok, video_id, filepath, error}
 
     def __init__(self, cfg: AppConfig, db: ExcelStore, url: str):
@@ -81,7 +88,7 @@ class ManualDownloadWorker(QThread):
                              self.cfg.download.cookies_from_browser,
                              self.cfg.download.cookies_file)
         res = dl.download(vid, "manual", self.url,
-                          progress_cb=lambda a, b, c: self.log.emit(f"  {a}: {b:.0f}% ({c})"),
+                          progress_cb=lambda a, b, c: self.progress.emit(a, b, c),
                           cancel_cb=self._cancel.is_set)
         if res.ok:
             self.db.set_download_status(vid, "downloaded", path=res.filepath)

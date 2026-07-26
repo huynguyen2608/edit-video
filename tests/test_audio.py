@@ -29,6 +29,49 @@ def test_default_keeps_original_audio():
     assert "0:a?" in cmd and "-an" not in cmd
 
 
+def test_generated_edge_voiceover_overrides_manual_voiceover():
+    e = EditorCfg()
+    e.audio.voiceover = "manual.mp3"
+    ri = RenderInputs(video="in.mp4", src_w=1920, src_h=1080,
+                      voiceover_path="edge.mp3")
+    cmd = export.build_command(e, ri, "out.mp4")
+    assert "edge.mp3" in cmd
+    assert "manual.mp3" not in cmd
+
+
+def test_edge_voiceover_excludes_isolated_and_original_speech():
+    e = EditorCfg()
+    ri = RenderInputs(video="in.mp4", src_w=1920, src_h=1080,
+                      voiceover_path="edge.mp3", vocals_wav="vocals.wav",
+                      has_audio=True)
+    cmd = export.build_command(e, ri, "out.mp4")
+    joined = " ".join(cmd)
+    assert "edge.mp3" in cmd
+    assert "vocals.wav" not in cmd
+    assert "[0:a]aresample" not in joined
+
+
+def test_voiceover_ignores_audio_speed_to_stay_synced():
+    """Có lồng tiếng -> tempo CHỈ theo cfg.speed (bỏ audio_speed) để không lệch lời."""
+    e = EditorCfg(); e.speed = 1.0; e.audio.audio_speed = 2.0; e.audio.pitch_shift_semitones = 0
+    g_vo = ao.build_audio_filtergraph(e, original="0:a", voiceover="1:a")
+    assert "atempo" not in g_vo                      # tempo = 1.0 -> không đổi nhịp
+    # Không lồng tiếng nhưng có nhạc -> tempo = speed*audio_speed = 2.0
+    g_music = ao.build_audio_filtergraph(e, original="0:a", music="1:a")
+    assert "atempo=2.0" in g_music
+
+
+def test_edge_voiceover_can_mix_only_with_background_music():
+    e = EditorCfg()
+    e.audio.replace_music = "music.mp3"
+    ri = RenderInputs(video="in.mp4", src_w=1920, src_h=1080,
+                      voiceover_path="edge.mp3", vocals_wav="vocals.wav")
+    joined = " ".join(export.build_command(e, ri, "out.mp4"))
+    assert "edge.mp3" in joined and "music.mp3" in joined
+    assert "vocals.wav" not in joined
+    assert "sidechaincompress" in joined
+
+
 def test_high_quality_encode_options_and_audio_copy():
     e = EditorCfg()
     e.speed = 1.0
@@ -169,3 +212,49 @@ def test_apad_appended_when_processing():
     e.speed = 2.0
     g = ao.build_audio_filtergraph(e, original="0:a")
     assert g.endswith("apad[aout]") and "atempo=2.0" in g
+
+
+def test_enhance_original_voice_builds_safe_filter_order():
+    e = EditorCfg()
+    e.audio.enhance_original_voice = True
+    g = ao.build_audio_filtergraph(e, original="0:a")
+    assert g.startswith("[0:a]aresample=44100,highpass=f=80,lowpass=f=18000")
+    assert "afftdn=nr=10:tn=1" in g
+    assert "equalizer=f=1500" in g and "acompressor=" in g
+    assert g.index("loudnorm=") < g.index("alimiter=") < g.index("apad")
+
+
+def test_enhancement_can_process_replacement_voiceover():
+    e = EditorCfg()
+    e.audio.enhance_original_voice = True
+    g = ao.build_audio_filtergraph(e, original="0:a", voiceover="1:a")
+    assert g.startswith("[1:a]aresample=44100,highpass=f=80")
+    assert "afftdn" in g and "loudnorm" in g
+
+
+def test_enhancement_forces_audio_reencode():
+    e = EditorCfg()
+    e.audio.enhance_original_voice = True
+    ri = RenderInputs("in.mp4", 1920, 1080, has_audio=True, audio_codec="aac")
+    joined = " ".join(export.build_command(e, ri, "out.mp4"))
+    assert "-c:a aac -b:a 256k" in joined
+    assert "loudnorm=I=-16.0:TP=-1.0:LRA=11" in joined
+
+
+def test_mono_enhancement_uses_mono_loudness_target():
+    e = EditorCfg()
+    e.audio.enhance_original_voice = True
+    ri = RenderInputs(
+        "in.mp4", 1920, 1080, has_audio=True, audio_codec="aac", audio_channels=1)
+    joined = " ".join(export.build_command(e, ri, "out.mp4"))
+    assert "loudnorm=I=-19.0:TP=-1.0:LRA=11" in joined
+
+
+def test_disabled_enhancement_keeps_copy_path():
+    e = EditorCfg()
+    e.speed = 1.0
+    e.audio.audio_speed = 1.0
+    e.audio.enhance_original_voice = False
+    ri = RenderInputs("in.mp4", 1920, 1080, has_audio=True, audio_codec="aac")
+    joined = " ".join(export.build_command(e, ri, "out.mp4"))
+    assert "-c:a copy" in joined and "afftdn" not in joined

@@ -117,7 +117,8 @@ def build_reframe_filter(src_w: int, src_h: int, aspect: str,
                          focus_x: float = 0.5, focus_y: float = 0.5,
                          zoom_percent: float = 0.0,
                          side_crop_percent: float = 0.0,
-                         output_short_edge: int = 1080) -> str:
+                         output_short_edge: int = 1080,
+                         side_squeeze_percent: float = 0.0) -> str:
     """Trả chuỗi filter_complex đưa [0:v] về khung đích, gán nhãn [rf] ở cuối.
 
     - fill_missing="none": crop-to-fill quanh (focus_x, focus_y) + zoom -> lấp đầy
@@ -135,32 +136,42 @@ def build_reframe_filter(src_w: int, src_h: int, aspect: str,
     """
     out_w, out_h = target_resolution(aspect, output_short_edge)
     target_ar = out_w / out_h
+    src_ar = src_w / src_h if src_h else 0.0
+
+    # Co ngang: CHỈ nguồn đúng 16:9 — nén bớt chiều rộng TRƯỚC khi reframe/cắt 2 bên,
+    # để giữ nhiều nội dung hai bên hơn khi về 9:16 (đổi lại hình hơi thon). Kẹp 0..10%.
+    sq = max(0.0, min(10.0, float(side_squeeze_percent))) / 100.0
+    is_16_9 = bool(src_ar) and abs(src_ar - 16.0 / 9.0) / (16.0 / 9.0) <= 0.02
+    prefix, vin, eff_w = "", "0:v", src_w
+    if sq > 0 and is_16_9:
+        keep = 1.0 - sq
+        prefix = f"[0:v]scale=trunc(iw*{keep:.4f}/2)*2:ih:flags=lanczos[sqz];"
+        vin, eff_w = "sqz", int(round(src_w * keep))
 
     if fill_missing in ("blur", "pad_black"):
         # Giữ toàn nội dung: fit vào khung, lấp nền.
         if fill_missing == "blur":
-            src_ar = src_w / src_h if src_h else 0.0
             same_portrait_frame = (aspect == "9:16" and target_ar > 0 and
                                    abs(src_ar - target_ar) / target_ar <= 0.02)
             if same_portrait_frame:
                 crop4 = four_edge_crop_expr(side_crop_percent)
-                return f"[0:v]{crop4}scale={out_w}:{out_h}:flags=lanczos[rf]"
+                return f"{prefix}[{vin}]{crop4}scale={out_w}:{out_h}:flags=lanczos[rf]"
             sc = side_crop_expr(side_crop_percent)  # cắt hai bên foreground trước khi scale
             return (
-                f"[0:v]split=2[bg][fg];"
+                f"{prefix}[{vin}]split=2[bg][fg];"
                 f"[bg]scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,"
                 f"crop={out_w}:{out_h},gblur=sigma=22[bgb];"
                 f"[fg]{sc}scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos[fgs];"
                 f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2[rf]"
             )
-        return (  # pad_black — không đổi
-            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        return (  # pad_black — không đổi (ngoài co ngang)
+            f"{prefix}[{vin}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black[rf]"
         )
 
-    # crop-to-fill quanh focus
-    rect = compute_crop_rect(src_w, src_h, target_ar, focus_x, focus_y, zoom_percent)
-    return f"[0:v]{rect.as_ffmpeg()},scale={out_w}:{out_h}:flags=lanczos[rf]"
+    # crop-to-fill quanh focus (rect tính theo chiều rộng ĐÃ co để cắt đúng)
+    rect = compute_crop_rect(eff_w, src_h, target_ar, focus_x, focus_y, zoom_percent)
+    return f"{prefix}[{vin}]{rect.as_ffmpeg()},scale={out_w}:{out_h}:flags=lanczos[rf]"
 
 
 def build_transform_chain(label_in: str, label_out: str, *,
@@ -169,30 +180,18 @@ def build_transform_chain(label_in: str, label_out: str, *,
                           saturation: float = 1.0, color_enabled: bool = False) -> str:
     """Nối các biến đổi 1-input sau reframe: lật ngang, mirror, color grading.
 
-    mirror_crop: cắt nửa trái, lật đối xứng sang phải (hiệu ứng gương).
+    mirror_crop là tham số tương thích cấu hình cũ và không còn tạo hiệu ứng.
+    flip_horizontal luôn lật TOÀN BỘ khung bằng hflip.
     """
     parts: list[str] = []
     if flip_horizontal:
         parts.append("hflip")
-    if mirror_crop:
-        # lấy nửa trái rồi ghép với bản lật -> khung đối xứng
-        parts.append("crop=iw/2:ih:0:0,split[ml][mr];[mr]hflip[mrf];[ml][mrf]hstack")
     if color_enabled:
         parts.append(f"eq=brightness={brightness}:contrast={contrast}:saturation={saturation}")
 
     if not parts:
         return f"[{label_in}]copy[{label_out}]"
-    # mirror_crop tự chứa split/hstack nên phải xử lý riêng chuỗi
-    chain = ",".join(p for p in parts if "split" not in p)
-    if any("split" in p for p in parts):
-        mirror = next(p for p in parts if "split" in p)
-        pre = ",".join(p for p in parts[:parts.index(mirror)]) or "copy"
-        post = ",".join(parts[parts.index(mirror) + 1:])
-        seg = f"[{label_in}]{pre}," if pre != "copy" else f"[{label_in}]"
-        s = f"{seg}{mirror}"
-        s += f",{post}" if post else ""
-        return f"{s}[{label_out}]"
-    return f"[{label_in}]{chain}[{label_out}]"
+    return f"[{label_in}]{','.join(parts)}[{label_out}]"
 
 
 def _fmt_num(f: float) -> str:

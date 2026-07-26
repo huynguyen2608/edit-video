@@ -45,7 +45,7 @@ QPushButton:disabled, QToolButton:disabled {
 }
 
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-    min-height: 24px;
+    min-height: 28px;
     color: #0f172a;
     background: #ffffff;
     border: 1px solid #cbd5e1;
@@ -68,6 +68,10 @@ QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
     background: #f1f5f9;
     border-color: #e2e8f0;
 }
+QComboBox {
+    /* Bung danh sách THẢ XUỐNG ngay dưới ô, không canh theo option đang chọn. */
+    combobox-popup: 0;
+}
 QComboBox QAbstractItemView {
     color: #0f172a;
     background: #ffffff;
@@ -75,6 +79,10 @@ QComboBox QAbstractItemView {
     selection-background-color: #dbeafe;
     selection-color: #0f172a;
     outline: 0;
+    padding: 2px;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 24px;
 }
 
 QTableWidget, QTableView, QListWidget, QListView {
@@ -115,7 +123,9 @@ QTabBar::tab {
     color: #475569;
     background: #f8fafc;
     border: 1px solid transparent;
-    padding: 6px 12px;
+    padding: 9px 26px;
+    min-width: 130px;
+    font-size: 13px;
 }
 QTabBar::tab:hover {
     color: #1e3a8a;
@@ -174,3 +184,75 @@ def apply_theme(app) -> None:
     """Áp dụng palette nhất quán trước khi tạo bất kỳ cửa sổ nào."""
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLESHEET)
+
+
+class _ProportionalColumns:
+    """Giữ độ rộng cột theo TỈ LỆ % bề rộng bảng (tự lấp đầy), vẫn cho kéo chỉnh.
+
+    weights: list mỗi cột — số THỰC (float) = trọng số tỉ lệ; số NGUYÊN (int) = px CỐ ĐỊNH
+    (vd cột ảnh thu nhỏ). Phần rộng còn lại chia cho các cột tỉ lệ; cột tỉ lệ cuối lấy
+    phần dư để lấp khít, tránh chừa khoảng trống bên phải.
+    """
+    def __init__(self, table, weights, min_width: int = 50):
+        from PySide6.QtCore import QObject, QEvent, QTimer
+
+        self.table = table
+        self.weights = list(weights)
+        self.min_width = min_width
+        self._applying = False
+
+        class _Filter(QObject):
+            def eventFilter(_self, obj, event):
+                if event.type() in (QEvent.Resize, QEvent.Show):
+                    # The viewport receives its final width after the parent
+                    # resize event. Recalculate on the next event-loop tick.
+                    QTimer.singleShot(0, self.apply)
+                return False
+
+        self._filter = _Filter(table)
+        table.installEventFilter(self._filter)
+        table.viewport().installEventFilter(self._filter)
+        QTimer.singleShot(0, self.apply)
+
+    def apply(self) -> None:
+        if self._applying:
+            return
+        vp = self.table.viewport().width()
+        if vp <= 10:
+            return
+        self._applying = True
+        try:
+            weights = self.weights
+            fixed_total = sum(w for w in weights if isinstance(w, int))
+            flex_idx = [i for i, w in enumerate(weights) if not isinstance(w, int)]
+            flex_total = sum(weights[i] for i in flex_idx) or 1.0
+            avail = max(0, vp - fixed_total)
+            header = self.table.horizontalHeader()
+            used = 0
+            for k, i in enumerate(flex_idx):
+                if k == len(flex_idx) - 1:            # cột tỉ lệ CUỐI lấy phần dư -> khít mép
+                    px = max(self.min_width, avail - used)
+                else:
+                    px = max(self.min_width, int(avail * weights[i] / flex_total))
+                    used += px
+                header.resizeSection(i, px)
+            for i, w in enumerate(weights):
+                if isinstance(w, int):
+                    header.resizeSection(i, w)
+        finally:
+            self._applying = False
+
+
+def make_columns_resizable(table, weights=None, min_width: int = 50) -> None:
+    """Cho phép kéo chỉnh MỌI cột + tự phân bổ theo % để lấp đầy bảng (không chừa trống).
+
+    weights: trọng số tỉ lệ mỗi cột (float) hoặc px cố định (int) — xem _ProportionalColumns.
+    """
+    from PySide6.QtWidgets import QHeaderView
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.Interactive)   # kéo được
+    header.setStretchLastSection(False)
+    header.setMinimumSectionSize(min_width)
+    if weights:
+        # Giữ tham chiếu trên chính table để không bị thu gom rác.
+        table._proportional_columns = _ProportionalColumns(table, weights, min_width)

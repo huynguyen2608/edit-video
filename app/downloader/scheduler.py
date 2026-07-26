@@ -79,13 +79,20 @@ class ScanService:
     def cancel_all_downloads(self) -> None:
         self._stop_downloads.set()
 
+    def is_running(self) -> bool:
+        """True while this service owns the shared scan/download run."""
+        return self._running.is_set()
+
     def _is_cancelled(self, video_id: str) -> bool:
         with self._cancel_lock:
             return self._stop_downloads.is_set() or video_id in self._cancelled_videos
 
     # ---------------- quét ----------------
-    def scan_once(self) -> dict:
+    def scan_once(self, discover_only: bool = False, reconcile: bool = False) -> dict:
         """Quét mọi kênh, phát hiện video mới, tải video pending.
+
+        reconcile=True: đối chiếu kho với file thực tế TRƯỚC khi quét — video
+        'downloaded' mất file được reset về pending (tải lại) hoặc xóa (nếu local).
 
         Trả thống kê {discovered, downloaded, failed}. An toàn khi gọi từ nhiều
         nguồn nhờ _lock (lần quét thứ hai sẽ bỏ qua nếu đang chạy).
@@ -97,10 +104,24 @@ class ScanService:
         with self._cancel_lock:
             self._cancelled_videos.clear()
         self._running.set()
-        stats = {"discovered": 0, "downloaded": 0, "failed": 0, "cancelled": 0}
+        stats = {"discovered": 0, "downloaded": 0, "failed": 0, "cancelled": 0,
+                 "discover_only": discover_only, "reconcile": reconcile,
+                 "reconciled_reset": 0, "reconciled_removed": 0}
         try:
+            if reconcile:
+                from .reconcile import reconcile_library
+                rec = reconcile_library(self.db)
+                stats["reconciled_reset"] = len(rec["reset"])
+                stats["reconciled_removed"] = len(rec["removed"])
+                if rec["reset"] or rec["removed"]:
+                    self._log(f"  🔄 đối chiếu file: {len(rec['reset'])} video mất file → tải lại, "
+                              f"{len(rec['removed'])} video local mất file → xóa khỏi bảng.")
+                for vid in rec["reset"]:
+                    self.on_status(vid, "download_status", "pending")
+                for vid in rec["removed"]:
+                    self.on_status(vid, "removed", "")
             self._log("Bắt đầu quét kênh…")
-            if self.cfg.download.retry_failed:
+            if not discover_only and self.cfg.download.retry_failed:
                 n = self.db.reset_failed_downloads()
                 if n:
                     self._log(f"  ↻ thử tải lại {n} video lỗi trước đó.")
@@ -108,7 +129,7 @@ class ScanService:
                 if self._stop_downloads.is_set():
                     break
                 self._discover_channel(ch, stats)
-            if not self._stop_downloads.is_set():
+            if not discover_only and not self._stop_downloads.is_set():
                 self._download_pending(stats)
             stats["stopped"] = self._stop_downloads.is_set()
             suffix = f", đã dừng {stats['cancelled']}" if stats["cancelled"] else ""

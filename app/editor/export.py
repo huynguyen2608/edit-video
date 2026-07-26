@@ -42,11 +42,12 @@ def _escape_sub_path(path: str) -> str:
     return path.replace("\\", "/").replace(":", "\\\\:")
 
 
-def _subtitle_filter(cfg, sub_path: str) -> str:
+def _subtitle_filter(cfg, sub_path: str, out_w: int, out_h: int) -> str:
     scfg = cfg.subtitle
     align = _SUB_ALIGN.get(scfg.position, 2)
     style = f"Alignment={align},FontSize={int(scfg.font_size)},MarginV=40,Outline=1,Shadow=0"
-    return f"subtitles={_escape_sub_path(sub_path)}:force_style='{style}'"
+    return (f"subtitles={_escape_sub_path(sub_path)}:"
+            f"original_size={out_w}x{out_h}:force_style='{style}'")
 
 
 @dataclass
@@ -54,11 +55,14 @@ class RenderInputs:
     video: str
     src_w: int
     src_h: int
+    src_fps: float = 0.0
     focus_x: float = 0.5
     focus_y: float = 0.5
+    voiceover_path: Optional[str] = None
     vocals_wav: Optional[str] = None  # nếu đã tách giọng
     has_audio: bool = True            # nguồn có track audio không (tránh map [0:a] rỗng)
     audio_codec: str = ""             # để copy audio gốc khi tương thích MP4 và không xử lý
+    audio_channels: int = 2           # chọn đúng loudness mono/stereo
     subtitle_path: Optional[str] = None  # file .srt để burn lên video (nếu bật phụ đề)
     overlay_ass_path: Optional[str] = None  # file .ass chữ hook/CTA theo thời gian
 
@@ -83,15 +87,18 @@ def _build_video_filter(cfg: EditorCfg, ri: RenderInputs, input_map: dict[str, i
     parts.append(video_ops.build_reframe_filter(
         ri.src_w, ri.src_h, cfg.target_aspect, cfg.fill_missing,
         ri.focus_x, ri.focus_y, cfg.zoom_fill_percent, cfg.side_crop_percent, short_edge,
+        cfg.side_squeeze_percent,
     ))
 
     # 2) transform -> [tf]
     cg = cfg.color_grading
     parts.append(video_ops.build_transform_chain(
         "rf", "tf",
-        flip_horizontal=cfg.flip_horizontal, mirror_crop=cfg.mirror_crop,
+        flip_horizontal=cfg.flip_horizontal,
+        # Lật ngang là hflip TOÀN KHUNG. Không dùng mirror_crop cũ vì thao tác đó
+        # cắt nửa trái rồi nhân đôi, gây hình đối xứng như trong preview người dùng.
         brightness=cg.brightness, contrast=cg.contrast, saturation=cg.saturation,
-        color_enabled=cg.enabled,
+        color_enabled=cg.enabled, mirror_crop=False,
     ))
 
     # 3) speed (video) -> [sp]
@@ -124,7 +131,9 @@ def _build_video_filter(cfg: EditorCfg, ri: RenderInputs, input_map: dict[str, i
 
     # 6) phụ đề burn-in (chỉ ngôn ngữ đã chọn) — áp SAU khi đã về khung đích
     if cfg.subtitle.enabled and cfg.subtitle.burn_in and ri.subtitle_path:
-        parts.append(f"[{cur}]{_subtitle_filter(cfg, ri.subtitle_path)}[sub]")
+        out_w, out_h = video_ops.target_resolution(cfg.target_aspect, short_edge)
+        parts.append(
+            f"[{cur}]{_subtitle_filter(cfg, ri.subtitle_path, out_w, out_h)}[sub]")
         cur = "sub"
 
     # 7) chữ hook (giây đầu) + CTA (giây cuối) qua file .ass (libass tự đặt vị trí/size)
@@ -142,9 +151,11 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
     """Dựng lệnh ffmpeg đầy đủ (list argv). duration != None -> giới hạn (bản short)."""
     a = cfg.audio
     # mute_all: xóa HẾT âm thanh -> bỏ mọi nguồn audio, không map luồng nào (-an).
-    voiceover = None if a.mute_all else (a.voiceover or None)
+    voiceover = None if a.mute_all else (ri.voiceover_path or a.voiceover or None)
     music = None if a.mute_all else (a.replace_music or None)
-    vocals = None if a.mute_all else (ri.vocals_wav or None)
+    # Một video chỉ có MỘT nguồn lời. Khi có voiceover/TTS, vocals đã tách chỉ
+    # phục vụ transcript và tuyệt đối không được đưa vào graph để tránh chồng giọng.
+    vocals = None if (a.mute_all or voiceover) else (ri.vocals_wav or None)
 
     # ---- inputs (bám index để tham chiếu trong filter_complex) ----
     inputs: list[str] = []
@@ -167,7 +178,9 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
     # Chỉ dùng audio gốc nếu nguồn THỰC SỰ có track audio (tránh [0:a] rỗng -> ffmpeg lỗi).
     original = "0:a" if ri.has_audio else None
     tempo_factor = max(1e-6, float(cfg.speed)) * max(1e-6, float(a.audio_speed))
-    needs_proc = bool(a.pitch_shift_semitones) or abs(tempo_factor - 1.0) > 1e-6
+    needs_proc = (bool(a.pitch_shift_semitones)
+                  or bool(getattr(a, "enhance_original_voice", False))
+                  or abs(tempo_factor - 1.0) > 1e-6)
     has_any_audio = bool(voiceover or vocals or original or music)
 
     if a.mute_all or not has_any_audio:
@@ -178,6 +191,7 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
             voiceover=f"{input_map['voiceover']}:a" if voiceover else None,
             vocals=f"{input_map['vocals']}:a" if vocals else None,
             music=f"{input_map['music']}:a" if music else None,
+            audio_channels=ri.audio_channels,
         )
         audio_map = ["-map", "[aout]"]
     else:
@@ -250,8 +264,14 @@ def render(cfg: EditorCfg, ri: RenderInputs, out_path: str,
     # chèn -progress pipe:1 -nostats (option toàn cục, ngay sau 'ffmpeg')
     cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
     try:
+        source_seconds = (
+            float(duration) if duration
+            else float(duration_hint or 0.0) * max(1e-6, float(cfg.speed)))
+        expected_frames = source_seconds * max(0.0, float(ri.src_fps))
         rc, err = _run_ffmpeg_progress(
-            cmd, duration_hint or duration or 0.0, progress_cb or (lambda _f: None), cancel_cb)
+            cmd, duration_hint or duration or 0.0,
+            progress_cb or (lambda _f: None), cancel_cb,
+            expected_frames=expected_frames)
     except EditCancelled:
         Path(out_path).unlink(missing_ok=True)
         raise
@@ -261,7 +281,7 @@ def render(cfg: EditorCfg, ri: RenderInputs, out_path: str,
 
 
 def _run_ffmpeg_progress(cmd: list[str], duration_hint: float, progress_cb,
-                         cancel_cb=None) -> tuple[int, str]:
+                         cancel_cb=None, expected_frames: float = 0.0) -> tuple[int, str]:
     """Chạy ffmpeg, đọc `-progress` từ stdout -> gọi progress_cb(fraction 0..1).
 
     stderr ghi ra FILE TẠM (không dùng PIPE) để tránh deadlock khi buffer stderr đầy
@@ -287,14 +307,21 @@ def _run_ffmpeg_progress(cmd: list[str], duration_hint: float, progress_cb,
             watcher.start()
         for line in proc.stdout:                       # từng dòng key=value
             line = line.strip()
-            if line.startswith("out_time_us=") and duration_hint > 0:
+            if line.startswith("frame=") and expected_frames > 0:
+                try:
+                    frame = int(line.split("=", 1)[1])
+                except ValueError:
+                    continue
+                # 99% là khung hình cuối; chỉ báo hoàn tất sau khi process thoát.
+                progress_cb(max(0.0, min(0.99, frame / expected_frames)))
+            elif (line.startswith("out_time_us=") and duration_hint > 0
+                  and expected_frames <= 0):
                 try:
                     us = int(line.split("=", 1)[1])
                 except ValueError:
                     continue
-                progress_cb(max(0.0, min(1.0, us / 1_000_000.0 / duration_hint)))
-            elif line == "progress=end":
-                progress_cb(1.0)
+                progress_cb(max(
+                    0.0, min(0.99, us / 1_000_000.0 / duration_hint)))
         rc = proc.wait()
         if watcher:
             watcher.join(timeout=0.3)
@@ -302,6 +329,8 @@ def _run_ffmpeg_progress(cmd: list[str], duration_hint: float, progress_cb,
         err = errf.read()
     if cancelled.is_set():
         raise EditCancelled("Đã dừng FFmpeg của video hiện tại")
+    if rc == 0:
+        progress_cb(1.0)
     return rc, err
 
 

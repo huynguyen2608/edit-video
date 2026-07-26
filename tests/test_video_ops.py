@@ -6,6 +6,23 @@ import pytest
 from app.editor import video_ops as vo
 
 
+def test_reframe_squeeze_only_for_16_9():
+    # Nguồn ĐÚNG 16:9 + squeeze -> có bước co ngang [sqz] và scale nén rộng.
+    f = vo.build_reframe_filter(1920, 1080, "9:16", "blur", side_squeeze_percent=10)
+    assert "[sqz]" in f and "scale=trunc(iw*0.9000/2)*2:ih" in f
+    # Chế độ crop-to-fill (none) cũng áp dụng co ngang cho 16:9.
+    assert "[sqz]" in vo.build_reframe_filter(1920, 1080, "9:16", "none", side_squeeze_percent=8)
+
+
+def test_reframe_no_squeeze_when_not_16_9_or_zero():
+    # Nguồn 9:16 (không phải 16:9) -> KHÔNG co ngang.
+    assert "[sqz]" not in vo.build_reframe_filter(1080, 1920, "9:16", "blur", side_squeeze_percent=10)
+    # Nguồn 4:3 -> KHÔNG co ngang (chỉ đúng 16:9).
+    assert "[sqz]" not in vo.build_reframe_filter(1440, 1080, "9:16", "blur", side_squeeze_percent=10)
+    # squeeze = 0 -> KHÔNG co ngang.
+    assert "[sqz]" not in vo.build_reframe_filter(1920, 1080, "9:16", "blur", side_squeeze_percent=0)
+
+
 def test_target_resolution():
     assert vo.target_resolution("9:16") == (1080, 1920)
     assert vo.target_resolution("1:1") == (1080, 1080)
@@ -99,6 +116,16 @@ def test_reframe_square_still_uses_side_crop_and_blur():
     f = vo.build_reframe_filter(1080, 1080, "9:16", fill_missing="blur", side_crop_percent=5)
     assert "crop=trunc(iw*0.9000/2)*2:ih" in f
     assert "gblur" in f and "overlay" in f
+
+
+def test_export_flip_is_full_frame_and_never_half_mirror():
+    from app.config import EditorCfg
+    from app.editor import export
+    e = EditorCfg(); e.flip_horizontal = True; e.mirror_crop = True
+    ri = export.RenderInputs("in.mp4", 1080, 1920)
+    graph = export._build_video_filter(e, ri, {"video": 0})
+    assert "hflip" in graph
+    assert "hstack" not in graph and "crop=iw/2" not in graph
 
 
 def test_reframe_pad_black_unaffected_by_side_crop():

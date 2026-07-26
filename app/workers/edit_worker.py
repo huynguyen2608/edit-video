@@ -65,7 +65,8 @@ class EditWorker(QThread):
     log = Signal(str, str)                   # (video_id, message)
     queue_finished = Signal()
 
-    def __init__(self, cfg: AppConfig, db: ExcelStore, device: str = "auto"):
+    def __init__(self, cfg: AppConfig, db: ExcelStore, device: str = "auto",
+                 preferred_id: str | None = None):
         super().__init__()
         self.cfg = cfg
         self.db = db
@@ -73,12 +74,23 @@ class EditWorker(QThread):
         self.qm = QueueManager(cfg, db)
         self._stop = threading.Event()
         self._pause = threading.Event()
+        self._skip_current = threading.Event()   # tạm dừng video hiện tại (không dừng cả queue)
+        self._preferred_id = preferred_id
         self._last_emit = 0.0
 
     # ---------------- điều khiển ----------------
     def request_stop(self) -> None:
         self._stop.set()
         self._pause.clear()
+
+    def skip_current(self, preferred_next: str | None = None) -> None:
+        """Tạm dừng video ĐANG xử lý: đưa về 'Đang chờ' rồi tiếp tục video kế tiếp
+        (hoặc video đã chọn nếu truyền preferred_next). KHÔNG dừng cả hàng đợi."""
+        self._preferred_id = preferred_next
+        self._skip_current.set()
+
+    def _should_cancel(self) -> bool:
+        return self._stop.is_set() or self._skip_current.is_set()
 
     def pause(self) -> None:
         self._pause.set()
@@ -99,9 +111,13 @@ class EditWorker(QThread):
             self._wait_if_paused()
             if self._stop.is_set():
                 break
-            vid = self.qm.next_pending()
+            # Video tạm dừng có job_status=PAUSED nên next_pending KHÔNG chọn lại nó
+            # (chỉ chọn Đang chờ/Gián đoạn) -> tự nhảy sang video kế, hoặc dừng nếu hết.
+            vid = self.qm.next_pending(self._preferred_id)
+            self._preferred_id = None
             if not vid:
                 break
+            self._skip_current.clear()   # cờ skip chỉ áp cho video sắp xử lý
             self._process(vid)
         self.queue_finished.emit()
 
@@ -110,10 +126,12 @@ class EditWorker(QThread):
         return active_stages(
             smart_crop=(e.fill_missing == "none" and e.crop_mode == "auto"),
             audio_sep=e.audio.separate_speech,
-            speech=(e.export.make_content_txt or e.subtitle.enabled
+            speech=(e.export.make_content_txt or e.subtitle.enabled or e.tts.enabled
                     or (e.intro_hook.enabled and e.intro_hook.auto)),
             subtitle=e.subtitle.enabled,
-            translation=bool(e.subtitle.enabled and e.subtitle.translate_to),
+            translation=bool((e.subtitle.enabled and e.subtitle.translate_to)
+                             or (e.tts.enabled and not e.subtitle.enabled and e.tts.language)),
+            tts=e.tts.enabled,
         )
 
     def _emit_progress(self, vid: str, tr: ProgressTracker, force: bool = False) -> None:
@@ -123,18 +141,30 @@ class EditWorker(QThread):
         self._last_emit = now
         self.progress_changed.emit(vid, tr.percent(), fmt_eta(tr.eta_seconds(now)))
 
+    def _handle_cancel(self, vid: str) -> None:
+        """Video hiện tại bị hủy giữa chừng: quyết định 'Tạm dừng' (skip) hay 'Gián đoạn' (stop)."""
+        self.db.set_edit_status(vid, "pending", error=None)
+        if self._skip_current.is_set() and not self._stop.is_set():
+            # Tạm dừng video hiện tại: chuyển TẠM DỪNG (đếm ở 'Đang chờ', hiển thị 'Tạm dừng'),
+            # KHÔNG tự chạy lại — worker đi tiếp video kế/đã chọn, hoặc dừng nếu hết.
+            self._skip_current.clear()
+            self.db.update_job(vid, job_status=Status.PAUSED, stage="", progress=0)
+            self.status_changed.emit(vid, Status.PAUSED)
+        else:
+            # Dừng cả hàng đợi (đóng app / bấm Dừng): Gián đoạn, tiếp tục được sau.
+            self.db.update_job(vid, job_status=Status.INTERRUPTED, stage="")
+            self.status_changed.emit(vid, Status.INTERRUPTED)
+        self.job_cancelled.emit(vid)
+
     def _process(self, vid: str) -> None:
         row = self.db.get_video(vid)
         if not row or not row.download_path:
             return
         tr = ProgressTracker(self._active_stages(), start_time=time.time())
         try:
-            meta = _probe_meta(row.download_path, self._stop.is_set)
+            meta = _probe_meta(row.download_path, self._should_cancel)
         except EditCancelled:
-            self.db.set_edit_status(vid, "pending", error=None)
-            self.db.update_job(vid, job_status=Status.INTERRUPTED, stage="")
-            self.status_changed.emit(vid, Status.INTERRUPTED)
-            self.job_cancelled.emit(vid)
+            self._handle_cancel(vid)
             return
         self.db.update_job(vid, job_status=Status.PREPARING, stage=Stage.READING, progress=0,
                            duration=meta.get("duration"), resolution=meta.get("resolution"),
@@ -156,13 +186,11 @@ class EditWorker(QThread):
 
         pipe = EditPipeline(self.cfg, self.db, on_log=lambda m: self.log.emit(vid, m),
                             device=self.device, on_stage=on_stage, on_render_progress=on_render,
-                            cancel_cb=self._stop.is_set)
+                            cancel_cb=self._should_cancel)
         try:
             pipe.process_one_by_id(vid)   # pipeline tự set edit_status done/failed
         except EditCancelled:
-            self.db.update_job(vid, job_status=Status.INTERRUPTED, stage="")
-            self.status_changed.emit(vid, Status.INTERRUPTED)
-            self.job_cancelled.emit(vid)
+            self._handle_cancel(vid)
             return
         done = self.db.get_video(vid)
         if done and done.edit_status == "done":

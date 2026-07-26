@@ -5,6 +5,7 @@ feedparser>=6.0            # đọc RSS feed kênh YouTube (không tốn quota A
 APScheduler>=3.10,<4       # job quét định kỳ 30 phút
 PyYAML>=6.0                # đọc config.yaml
 requests>=2.31
+edge-tts>=7.0,<8            # lồng tiếng online, danh sách giọng Edge nam/nữ theo ngôn ngữ
 openpyxl>=3.1             # kho trạng thái = file Excel nhiều sheet (thay cho database)
 
 # ---- Xử lý ảnh / smart-crop ----
