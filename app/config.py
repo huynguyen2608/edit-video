@@ -146,7 +146,7 @@ class ExportCfg:
     make_content_txt: bool = False
     video_codec: str = "libx264"
     crf_or_cq: int = 20
-    encoder_preset: str = "slow"
+    encoder_preset: str = "medium"
     output_short_edge: int = 0     # 0 = tự chọn theo nguồn; 720/1080/1440/2160
     audio_bitrate_kbps: int = 256
     copy_audio_when_unchanged: bool = True

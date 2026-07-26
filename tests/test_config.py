@@ -68,7 +68,7 @@ def test_ai_device_defaults_to_auto_and_can_be_saved():
 def test_high_quality_export_defaults():
     e = EditorCfg()
     assert e.export.video_codec == "libx264"
-    assert e.export.crf_or_cq == 20 and e.export.encoder_preset == "slow"
+    assert e.export.crf_or_cq == 20 and e.export.encoder_preset == "medium"
     assert e.export.output_short_edge == 0
     assert e.export.audio_bitrate_kbps == 256
 

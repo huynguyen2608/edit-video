@@ -235,10 +235,9 @@ class EditPipeline:
                 self._segment_mode = False
             # Mỗi phần dài có một cặp full/short; xóa toàn bộ sidecar và thư mục
             # tạm của tách giọng/TTS sau khi tất cả phần đã render thành công.
-            keep = [
-                str(path) for path in out_base.rglob("*.mp4")
-                if path.name.lower().endswith(("_full.mp4", "_short.mp4"))
-            ]
+            # Folder tạm chia đoạn nằm riêng; mọi MP4 trực tiếp trong out_base
+            # đều là bản chỉnh sửa chính hoặc short của từng phần.
+            keep = [str(path) for path in out_base.rglob("*.mp4")]
             self._cleanup_output_artifacts(out_base, keep)
             self.db.set_edit_status(row.video_id, "done")
             self._stage(row.video_id, Stage.COMPLETED)

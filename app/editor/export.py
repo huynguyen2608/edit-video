@@ -210,7 +210,7 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
     cmd += [
         "-c:v", cfg.export.video_codec,
         "-cq" if "nvenc" in cfg.export.video_codec else "-crf", str(cfg.export.crf_or_cq),
-        "-preset", getattr(cfg.export, "encoder_preset", "slow"),
+        "-preset", getattr(cfg.export, "encoder_preset", "medium"),
         "-pix_fmt", "yuv420p",
     ]
     if not a.mute_all:
@@ -221,10 +221,10 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
             cmd += ["-c:a", "copy"]
         else:
             cmd += ["-c:a", "aac", "-b:a", f"{getattr(cfg.export, 'audio_bitrate_kbps', 256)}k"]
-    cmd += [
-        "-movflags", "+faststart",
-        "-shortest",                     # chặn output chạy dài theo nhạc/voiceover lặp
-    ]
+    # File được dùng trên máy local nên không cần +faststart. Tùy chọn đó buộc
+    # FFmpeg di chuyển metadata lên đầu và có thể đọc/ghi lại toàn bộ MP4 sau
+    # khi encode, khiến giao diện đứng rất lâu gần 96% với file lớn.
+    cmd += ["-shortest"]                  # chặn output chạy dài theo nhạc/voiceover lặp
     if duration:
         cmd += ["-t", str(duration)]     # output option: chặn cứng độ dài bản short
     cmd += [out_path]
@@ -369,7 +369,7 @@ def make_short_from_full(full_path: str, out_path: str, seconds: float,
                 "-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-c", "copy"]
-    cmd += ["-movflags", "+faststart", out_path]
+    cmd += [out_path]
     try:
         proc = run_cancellable(cmd, cancel_cb=cancel_cb, capture_output=True, text=True)
     except EditCancelled:

@@ -146,7 +146,7 @@ editor:
     make_content_txt: false # chỉ giữ 2 video đầu ra; transcript là file trung gian
     video_codec: "libx264" # chất lượng ổn định; GPU NVIDIA có thể chọn h264_nvenc
     crf_or_cq: 20 # 18=rất cao, 20=cân bằng chất lượng cao, 23=nhẹ hơn
-    encoder_preset: "slow"
+    encoder_preset: "medium"       # cân bằng tốc độ/chất lượng; chọn fast nếu CPU yếu
     output_short_edge: 0 # 0=tự chọn theo nguồn; hoặc 720/1080/1440/2160
     audio_bitrate_kbps: 256
     copy_audio_when_unchanged: true

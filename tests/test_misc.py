@@ -199,10 +199,16 @@ def test_safe_name_strips_forbidden():
 
 def test_output_filename_uses_original_source_name_and_legacy_fallback(tmp_path):
     new = output_video_path(tmp_path, "D:/input/My old video.mp4", "abc123", "full")
-    assert new.name == "My old video_full.mp4"
+    assert new.name == "My old video.mp4"
     legacy = tmp_path / "abc123_full.mp4"; legacy.write_bytes(b"old")
     assert existing_output_video_path(
         tmp_path, "D:/input/My old video.mp4", "abc123", "full") == legacy
+
+
+def test_short_filename_keeps_original_name_with_short_suffix(tmp_path):
+    short = output_video_path(
+        tmp_path, "D:/input/My old video.mov", "abc123", "short")
+    assert short.name == "My old video_short.mp4"
 
 
 def test_output_cleanup_keeps_only_full_and_short_videos(tmp_path):

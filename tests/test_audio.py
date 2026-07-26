@@ -77,7 +77,8 @@ def test_high_quality_encode_options_and_audio_copy():
     e.speed = 1.0
     ri = RenderInputs("in.mp4", 1920, 1080, has_audio=True, audio_codec="aac")
     joined = " ".join(export.build_command(e, ri, "out.mp4"))
-    assert "-crf 20" in joined and "-preset slow" in joined
+    assert "-crf 20" in joined and "-preset medium" in joined
+    assert "+faststart" not in joined
     assert "-pix_fmt yuv420p" in joined and "-c:a copy" in joined
 
 

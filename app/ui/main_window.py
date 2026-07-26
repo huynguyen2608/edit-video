@@ -918,9 +918,11 @@ class MainWindow(QMainWindow):
         self._bind_int(self.sp_encode_quality, self.cfg.editor.export, "crf_or_cq", "Chất lượng mã hóa")
         bform.addRow("Chất lượng CRF/CQ", self.sp_encode_quality)
         self.cmb_encode_preset = self._data_combo([
-            ("medium", "Medium — nhanh"), ("slow", "Slow — chất lượng/dung lượng tốt"),
+            ("fast", "Fast — ưu tiên tốc độ"),
+            ("medium", "Medium — cân bằng (khuyên dùng)"),
+            ("slow", "Slow — chất lượng/dung lượng tốt"),
             ("slower", "Slower — rất chậm"),
-        ], getattr(self.cfg.editor.export, "encoder_preset", "slow"))
+        ], getattr(self.cfg.editor.export, "encoder_preset", "medium"))
         self._bind_combo(self.cmb_encode_preset, self.cfg.editor.export,
                          "encoder_preset", "Preset mã hóa")
         bform.addRow("Preset mã hóa", self.cmb_encode_preset)
@@ -2393,10 +2395,6 @@ class MainWindow(QMainWindow):
         form.addRow("Âm lượng nhạc nền", self.sp_mvol)
         form.addRow("Nhạc nền thay thế", self._audio_file_row("replace_music"))
         self._build_voiceover_controls(form)   # "Lồng tiếng": gộp Edge TTS + file thu sẵn
-        self.cmb_shortmode = self._data_combo(
-            [("start", "Đoạn đầu video"), ("highlight", "Đoạn sôi động nhất")], e.export.short_mode)
-        self._bind_combo(self.cmb_shortmode, e.export, "short_mode", "Cách chọn short")
-        form.addRow("Cách chọn bản short", self.cmb_shortmode)
         btn_reset = QPushButton("Khôi phục mặc định")
         btn_reset.clicked.connect(self._restore_advanced_defaults)
         form.addRow("", btn_reset)
@@ -2457,11 +2455,6 @@ class MainWindow(QMainWindow):
         self.chk_fp.setChecked(e.fingerprint_enabled)
         self._bind_bool(self.chk_fp, e, "fingerprint_enabled", "Fingerprint")
         form.addRow("Chống trùng", self.chk_fp)
-        self.cmb_shortmode = self._data_combo(
-            [("start", "100s đầu"), ("highlight", "Đoạn sôi động nhất")], e.export.short_mode)
-        self._bind_combo(self.cmb_shortmode, e.export, "short_mode", "Kiểu chọn short")
-        form.addRow("Cách lấy bản short", self.cmb_shortmode)
-
         self.sp_pitch = self._spin(QSpinBox, -12, 12, a.pitch_shift_semitones)
         self._bind_int(self.sp_pitch, a, "pitch_shift_semitones", "Pitch")
         form.addRow("Pitch shift (nửa cung)", self.sp_pitch)

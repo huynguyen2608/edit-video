@@ -42,12 +42,22 @@ def output_basename(source_path: str | Path, video_id: str) -> str:
 
 def output_video_path(output_dir: str | Path, source_path: str | Path,
                       video_id: str, kind: str = "full") -> Path:
-    return Path(output_dir) / f"{output_basename(source_path, video_id)}_{kind}.mp4"
+    base = output_basename(source_path, video_id)
+    # Bản chỉnh sửa chính giữ nguyên tên file nguồn. Chỉ các biến thể như short
+    # mới có hậu tố để người dùng nhận biết.
+    filename = f"{base}.mp4" if kind == "full" else f"{base}_{kind}.mp4"
+    return Path(output_dir) / filename
 
 
 def existing_output_video_path(output_dir: str | Path, source_path: str | Path,
                                video_id: str, kind: str = "full") -> Path:
     """Ưu tiên tên mới theo nguồn, fallback tên video_id của các bản xuất cũ."""
     new_path = output_video_path(output_dir, source_path, video_id, kind)
-    legacy = Path(output_dir) / f"{safe_name(video_id, 32)}_{kind}.mp4"
-    return new_path if new_path.exists() or not legacy.exists() else legacy
+    old_source_name = Path(output_dir) / f"{output_basename(source_path, video_id)}_{kind}.mp4"
+    old_id_name = Path(output_dir) / f"{safe_name(video_id, 32)}_{kind}.mp4"
+    if new_path.exists():
+        return new_path
+    for legacy in (old_source_name, old_id_name):
+        if legacy.exists():
+            return legacy
+    return new_path
