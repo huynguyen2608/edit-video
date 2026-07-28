@@ -123,14 +123,15 @@ class EditWorker(QThread):
 
     def _active_stages(self) -> list[str]:
         e = self.cfg.editor
+        want_subtitle = e.subtitle.enabled and e.subtitle.burn_in
         return active_stages(
             smart_crop=(e.fill_missing == "none" and e.crop_mode == "auto"),
             audio_sep=e.audio.separate_speech,
-            speech=(e.export.make_content_txt or e.subtitle.enabled or e.tts.enabled
+            speech=(e.export.make_content_txt or want_subtitle or e.tts.enabled
                     or (e.intro_hook.enabled and e.intro_hook.auto)),
-            subtitle=e.subtitle.enabled,
-            translation=bool((e.subtitle.enabled and e.subtitle.translate_to)
-                             or (e.tts.enabled and not e.subtitle.enabled and e.tts.language)),
+            subtitle=want_subtitle,
+            translation=bool((want_subtitle and e.subtitle.translate_to)
+                             or (e.tts.enabled and not want_subtitle and e.tts.language)),
             tts=e.tts.enabled,
         )
 

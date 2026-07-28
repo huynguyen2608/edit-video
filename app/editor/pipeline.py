@@ -22,7 +22,7 @@ from ..store import ExcelStore, VideoRow
 from ..logging_setup import get_logger
 from ..paths import ensure_dir, safe_name, output_video_path
 from . import (analyze, audio_ops, edge_tts_service, export, fingerprint, smart_crop, subtitles,
-               transcribe, translate, video_ops)
+               transcribe, translate, video_ops, work_cache)
 from .export import RenderInputs
 from .stages import Stage
 from .cancel import EditCancelled, run_cancellable
@@ -221,6 +221,27 @@ class EditPipeline:
                 key=lambda p: int(p.stem.rsplit("phần ", 1)[-1]))
             if not parts:
                 raise RuntimeError("FFmpeg không tạo được phần video nào.")
+            source_subtitle, source_lang = subtitles.find_source_subtitle(src)
+            source_cues = (
+                subtitles.normalize_cues(
+                    subtitles.read_subtitle(source_subtitle), float(duration))
+                if source_subtitle else [])
+            timeline = 0.0
+            if source_cues:
+                self._log(
+                    f"  ↪ chia phụ đề nguồn {source_subtitle.name} theo từng phần; "
+                    "không chạy lại Whisper.")
+                for part in parts:
+                    part_duration = float(
+                        smart_crop.probe_dimensions(str(part)).duration or 0.0)
+                    part_cues = subtitles.slice_cues(
+                        source_cues, timeline, timeline + part_duration)
+                    if part_cues:
+                        suffix = f".{source_lang}" if source_lang else ""
+                        part_srt = part.with_name(part.stem + suffix + ".srt")
+                        part_srt.write_text(
+                            subtitles.to_srt(part_cues), encoding="utf-8")
+                    timeline += part_duration
             last = EditOutputs()
             self._segment_mode = True
             try:
@@ -287,11 +308,17 @@ class EditPipeline:
         if hook.enabled and hook_text:
             items.append({"start": 0.0, "end": min(float(hook.seconds), out_dur),
                           "text": hook_text, "position": hook.position,
-                          "font_size": hook.font_size, "box": hook.box, "fade_ms": hook.fade_ms})
+                          "font_size": hook.font_size, "box": hook.box,
+                          "style_preset": hook.style_preset,
+                          "safe_margin_percent": hook.safe_margin_percent,
+                          "fade_ms": hook.fade_ms})
         if cta.enabled and cta.text.strip():
             items.append({"start": max(0.0, out_dur - float(cta.seconds)), "end": out_dur,
                           "text": cta.text, "position": cta.position,
-                          "font_size": cta.font_size, "box": cta.box, "fade_ms": cta.fade_ms})
+                          "font_size": cta.font_size, "box": cta.box,
+                          "style_preset": cta.style_preset,
+                          "safe_margin_percent": cta.safe_margin_percent,
+                          "fade_ms": cta.fade_ms})
         ow, oh = video_ops.target_resolution(ecfg.target_aspect)
         path = str(out_base / f"{artifact_id or row.video_id}_overlay.ass")
         Path(path).write_text(subtitles.build_overlay_ass(items, ow, oh), encoding="utf-8")
@@ -303,7 +330,16 @@ class EditPipeline:
         if ecfg.fill_missing != "none":
             return 0.5, 0.5
         if ecfg.crop_mode == "auto":
-            return smart_crop.detect_focus(src)
+            signature = work_cache.source_signature(src, "smart-crop-v1")
+            cache = work_cache.artifact_dir(
+                ecfg.output_dir, "focus", Path(src).stem, signature) / "focus.json"
+            saved = work_cache.load_json(cache, signature)
+            if saved:
+                self._log("  ↪ dùng lại tâm crop đã phân tích.")
+                return float(saved["x"]), float(saved["y"])
+            fx, fy = smart_crop.detect_focus(src)
+            work_cache.save_json(cache, signature, x=fx, y=fy)
+            return fx, fy
         if ecfg.crop_mode == "manual":
             self._log(f"  vùng crop thủ công: focus=({ecfg.manual_focus_x:.2f}, "
                       f"{ecfg.manual_focus_y:.2f})")
@@ -325,19 +361,44 @@ class EditPipeline:
         if ecfg.audio.separate_speech:
             self._stage(row.video_id, Stage.AUDIO)
             be = ecfg.audio.separator_backend
-            self._log(f"  [chuẩn bị] tách giọng thoại ({be}) — giữ nguyên hội thoại…")
-            wav = audio_ops.extract_audio(
-                src, str(out_base / f"{artifact_id}_audio.wav"),
-                cancel_cb=self.cancel_cb)
-            vocals = audio_ops.separate_speech(
-                wav, str(out_base / f"{artifact_id}_sep"), device=self.device,
-                backend=be, model=ecfg.audio.separator_model, cancel_cb=self.cancel_cb)
+            variant = f"{be}|{ecfg.audio.separator_model}|{self.device}"
+            signature = work_cache.source_signature(src, variant)
+            cache_dir = work_cache.artifact_dir(
+                ecfg.output_dir, "audio", row.video_id, signature)
+            manifest = work_cache.load_json(cache_dir / "manifest.json", signature)
+            cached_vocals = (
+                cache_dir / str(manifest.get("vocals", ""))
+                if manifest else None)
+            if cached_vocals and cached_vocals.is_file():
+                vocals = str(cached_vocals)
+                self._log(f"  ↪ dùng lại lời thoại đã tách ({be}).")
+            else:
+                self._log(f"  [chuẩn bị] tách giọng thoại ({be}) — giữ nguyên hội thoại…")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                wav = audio_ops.extract_audio(
+                    src, str(cache_dir / f"{artifact_id}_audio.wav"),
+                    cancel_cb=self.cancel_cb)
+                vocals = audio_ops.separate_speech(
+                    wav, str(cache_dir / f"{artifact_id}_sep"), device=self.device,
+                    backend=be, model=ecfg.audio.separator_model, cancel_cb=self.cancel_cb)
+                vocals_path = Path(vocals)
+                try:
+                    relative = str(vocals_path.relative_to(cache_dir))
+                except ValueError:
+                    stable = cache_dir / "vocals.wav"
+                    stable.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(vocals_path, stable)
+                    vocals = str(stable)
+                    relative = stable.name
+                work_cache.save_json(
+                    cache_dir / "manifest.json", signature, vocals=relative)
             self._check_cancel()
 
         scfg = ecfg.subtitle
         hook = ecfg.intro_hook
         want_auto_hook = hook.enabled and hook.auto and not hook.text.strip()
-        need_segments = (ecfg.export.make_content_txt or scfg.enabled
+        want_subtitle = scfg.enabled and scfg.burn_in
+        need_segments = (ecfg.export.make_content_txt or want_subtitle
                          or ecfg.tts.enabled or want_auto_hook)
         content_txt: Optional[str] = None
         srt_path: Optional[str] = None
@@ -345,19 +406,56 @@ class EditPipeline:
         if not need_segments:
             return vocals, content_txt, srt_path, hook_suggestion, None
 
+        source_subtitle, subtitle_lang = subtitles.find_source_subtitle(src)
+        cues = subtitles.read_subtitle(source_subtitle) if source_subtitle else []
+        lang = subtitle_lang
         self._stage(row.video_id, Stage.SPEECH)
-        self._log("  [chuẩn bị] transcribe lời thoại…")
-        cues, lang = transcribe.transcribe_segments(vocals or src, device=self.device)
-        self._check_cancel()
+        if cues:
+            self._log(f"  [chuẩn bị] dùng phụ đề nguồn đã tải: {source_subtitle.name}")
+        else:
+            if source_subtitle:
+                self._log(f"  ! không đọc được {source_subtitle.name} — dùng nhận diện lời thoại.")
+            else:
+                self._log("  [chuẩn bị] không có phụ đề nguồn — nhận diện lời thoại…")
+            cached = None
+            cache_path = None
+            if not self._segment_mode and Path(src).is_file():
+                variant = (
+                    f"speech={bool(ecfg.audio.separate_speech)}|"
+                    f"backend={ecfg.audio.separator_backend}|"
+                    f"model={ecfg.audio.separator_model}")
+                signature = work_cache.source_signature(src, variant)
+                cache_path = work_cache.transcript_path(
+                    ecfg.output_dir, row.video_id)
+                cached = work_cache.load_transcript(cache_path, signature)
+            if cached:
+                cues, lang = cached
+                self._log("  ↪ dùng lại transcript đã nhận diện trước đó.")
+            else:
+                cues, lang = transcribe.transcribe_segments(vocals or src, device=self.device)
+                if cache_path and cues:
+                    work_cache.save_transcript(cache_path, signature, cues, lang)
+                    self._log("  ↪ đã lưu transcript để dùng lại khi render lại.")
+            self._check_cancel()
+        cues = subtitles.normalize_cues(
+            cues, float(getattr(row, "duration", 0.0) or 0.0))
+        lang = subtitles.normalize_language(lang)
         if want_auto_hook:
             hook_suggestion = subtitles.pick_auto_hook(cues)
 
-        target_lang = (scfg.translate_to if scfg.enabled
+        target_lang = (scfg.translate_to if want_subtitle
                        else (ecfg.tts.language if ecfg.tts.enabled else ""))
-        want_tr = bool(target_lang and target_lang != lang)
-        work = subtitles.merge_short_cues(
-            cues, scfg.merge_gap_ms, scfg.min_cue_ms, scfg.max_cue_ms
-        ) if (scfg.enabled or ecfg.tts.enabled) else cues
+        want_tr = bool(
+            target_lang and not subtitles.languages_equivalent(target_lang, lang))
+        if want_subtitle:
+            # Giữ timestamp nguồn. Việc trình bày hai dòng được thực hiện lúc ghi SRT,
+            # không phân lại thời gian theo độ dài ký tự.
+            work = [subtitles.Cue(c.start, c.end, c.text, c.text2) for c in cues]
+        elif ecfg.tts.enabled:
+            work = subtitles.merge_short_cues(
+                cues, scfg.merge_gap_ms, scfg.min_cue_ms, scfg.max_cue_ms)
+        else:
+            work = cues
         if want_tr:
             self._stage(row.video_id, Stage.TRANSLATION)
             self._log(f"  [chuẩn bị] dịch nội dung sang '{target_lang}'…")
@@ -367,13 +465,30 @@ class EditPipeline:
                 want_tr = False
                 self._log("  ! không có công cụ dịch — dùng phụ đề ngôn ngữ gốc.")
 
-        if scfg.enabled and work:
+        if want_subtitle and work:
             self._stage(row.video_id, Stage.SUBTITLE)
-            srt_path = str(out_base / f"{artifact_id}.srt")
-            Path(srt_path).write_text(subtitles.to_srt(work, use_translation=want_tr),
-                                      encoding="utf-8")
-            self._log(f"  ✔ phụ đề .srt ({target_lang if want_tr else lang}): {srt_path}")
-        elif scfg.enabled:
+            max_chars = 40 if ecfg.target_aspect in {"9:16", "1:1"} else 50
+            if source_subtitle and not want_tr:
+                # Luôn tạo bản làm việc để chuẩn hóa cue và ngắt dòng, không sửa sidecar gốc.
+                working_srt = out_base / f"{artifact_id}_working.srt"
+                working_srt.write_text(
+                    subtitles.to_srt(
+                        work, max_chars=max_chars, max_lines=2),
+                    encoding="utf-8")
+                srt_path = str(working_srt)
+                self._log(
+                    f"  ✔ dùng timestamp phụ đề nguồn, tối ưu trình bày: {source_subtitle.name}")
+            else:
+                # Dịch hoặc Whisper dự phòng cần SRT làm việc tạm cho FFmpeg.
+                srt_path = str(out_base / f"{artifact_id}.srt")
+                Path(srt_path).write_text(
+                    subtitles.to_srt(
+                        work, use_translation=want_tr,
+                        max_chars=max_chars, max_lines=2),
+                    encoding="utf-8")
+                origin = "bản dịch" if want_tr else "Whisper dự phòng"
+                self._log(f"  ✔ phụ đề {origin}: {srt_path}")
+        elif want_subtitle:
             # Không nhận được lời thoại (video không có tiếng, hoặc thiếu faster-whisper):
             # BỎ QUA phụ đề để không burn file .srt rỗng gây lỗi FFmpeg/libass.
             self._log("  ! không nhận được lời thoại — bỏ qua phụ đề cho video này.")
@@ -387,19 +502,55 @@ class EditPipeline:
         if ecfg.tts.enabled:
             self._stage(row.video_id, Stage.TTS)
             spoken_lang = target_lang if want_tr else lang
-            spoken = " ".join(
-                (cue.text2 if want_tr and cue.text2 else cue.text).strip()
+            spoken_cues = [
+                (cue.start, cue.end,
+                 (cue.text2 if want_tr and cue.text2 else cue.text).strip())
                 for cue in work
-                if (cue.text2 if want_tr and cue.text2 else cue.text).strip())
+                if (cue.text2 if want_tr and cue.text2 else cue.text).strip()
+            ]
+            if not spoken_cues:
+                self._log("  ! không có nội dung lời thoại — bỏ qua lồng tiếng.")
+                return vocals, content_txt, srt_path, hook_suggestion, None
             self._log(f"  [chuẩn bị] tạo lồng tiếng Edge TTS ({spoken_lang})…")
             if vocals:
                 self._log("  ↪ lời đã tách chỉ dùng nhận diện transcript; đầu ra chỉ dùng Edge TTS.")
-            generated_voiceover, selected_voice = edge_tts_service.synthesize(
-                spoken, str(out_base / f"{artifact_id}_edge_tts.mp3"),
-                language=spoken_lang, voice=ecfg.tts.voice,
-                gender=ecfg.tts.gender, rate_percent=ecfg.tts.rate_percent,
-                cancel_cb=self.cancel_cb)
-            self._log(f"  ✔ giọng Edge TTS: {selected_voice}")
+            signature = work_cache.value_signature(
+                spoken_cues, spoken_lang, ecfg.tts.voice,
+                ecfg.tts.gender, ecfg.tts.rate_percent)
+            cache_dir = work_cache.artifact_dir(
+                ecfg.output_dir, "tts", row.video_id, signature)
+            manifest = work_cache.load_json(cache_dir / "manifest.json", signature)
+            cached_audio = (
+                cache_dir / str(manifest.get("audio", ""))
+                if manifest else None)
+            if cached_audio and cached_audio.is_file():
+                generated_voiceover = str(cached_audio)
+                selected_voice = str(manifest.get("voice", ecfg.tts.voice))
+                self._log(f"  ↪ dùng lại giọng Edge TTS: {selected_voice}")
+            else:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                selected_voice = edge_tts_service.choose_voice(
+                    spoken_lang, ecfg.tts.gender, ecfg.tts.voice)
+                timed_items = []
+                for index, (start, end, text) in enumerate(spoken_cues, 1):
+                    self._check_cancel()
+                    cue_path = cache_dir / f"cue_{index:04d}.mp3"
+                    edge_tts_service.synthesize_selected(
+                        text, str(cue_path), selected_voice=selected_voice,
+                        rate_percent=ecfg.tts.rate_percent,
+                        cancel_cb=self.cancel_cb)
+                    timed_items.append((str(cue_path), start, end))
+                generated_voiceover = audio_ops.compose_timed_voiceover(
+                    timed_items,
+                    str(cache_dir / f"{artifact_id}_edge_tts_timed.wav"),
+                    cancel_cb=self.cancel_cb)
+                generated_path = Path(generated_voiceover)
+                work_cache.save_json(
+                    cache_dir / "manifest.json", signature,
+                    audio=generated_path.name, voice=selected_voice)
+                self._log(
+                    f"  ✔ giọng Edge TTS: {selected_voice} · "
+                    f"đã đồng bộ {len(spoken_cues)} cue")
             self._check_cancel()
         return vocals, content_txt, srt_path, hook_suggestion, generated_voiceover
 

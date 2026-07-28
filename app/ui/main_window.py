@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from copy import deepcopy
 from pathlib import Path
 
 from PySide6.QtCore import (Qt, QObject, Signal, QRect, QSize, QPoint, QEvent,
@@ -23,20 +24,20 @@ from PySide6.QtWidgets import (
     QHeaderView, QMessageBox, QDialog, QCheckBox, QFileDialog, QComboBox,
     QGroupBox, QFormLayout, QGridLayout, QSpinBox, QDoubleSpinBox, QLineEdit, QScrollArea,
     QListWidget, QListWidgetItem, QLayout, QSizePolicy, QStackedWidget, QAbstractSpinBox,
-    QAbstractItemView,
+    QAbstractItemView, QColorDialog, QSplitter, QFrame, QInputDialog,
 )
 
-from ..config import AppConfig, ChannelCfg, EditorCfg, save_config
+from ..config import AppConfig, EditorCfg, save_config
+from ..source_controller import SourceController, SourceError
 from ..store import ExcelStore
 from ..logging_setup import get_logger
 from ..downloader.scheduler import ScanService
 from ..downloader.downloader import quality_format
 from ..editor import smart_crop, video_ops, preview
-from ..editor.local_source import ingest_folder, ingest_paths, list_videos
+from ..editor.local_source import ingest_folder, ingest_paths, list_videos, video_id_for
 from .queue_tab import QueueTab
 from .theme import make_columns_resizable
 from ..workers.jobs import ScanWorker, CheckChannelWorker, ManualDownloadWorker
-from ..presets import PLATFORM_PRESETS, apply_platform_preset
 from .. import report
 
 _COLS = ["Video ID", "Tiêu đề", "Kênh", "Tải", "Biên tập", "Thao tác"]
@@ -210,7 +211,7 @@ class _PosCanvas(QLabel):
 
 
 class _InteractivePreview(QLabel):
-    """Preview co giãn, click trực tiếp để đặt vị trí logo/hook/CTA."""
+    """Preview co giãn, click trực tiếp để đặt phụ đề/logo/hook/CTA."""
     clicked = Signal(float, float)
 
     def __init__(self, text: str = ""):
@@ -218,6 +219,7 @@ class _InteractivePreview(QLabel):
         self._source = QPixmap()
         self._markers: dict[str, tuple[float, float]] = {}
         self._active = "logo"
+        self._safe_margins = (0.0, 0.0, 0.0, 0.0)
         self.setAlignment(Qt.AlignCenter)
 
     def set_source(self, pixmap: QPixmap) -> None:
@@ -230,6 +232,13 @@ class _InteractivePreview(QLabel):
 
     def set_active(self, key: str) -> None:
         self._active = key
+        self.update()
+
+    def set_safe_margins(self, left: float, right: float,
+                         top: float, bottom: float) -> None:
+        self._safe_margins = tuple(
+            max(0.0, min(0.45, float(value) / 100.0))
+            for value in (left, right, top, bottom))
         self.update()
 
     def resizeEvent(self, event) -> None:
@@ -255,14 +264,27 @@ class _InteractivePreview(QLabel):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if not self._markers or self.pixmap() is None or self.pixmap().isNull():
+        if self.pixmap() is None or self.pixmap().isNull():
             return
         pix = self.pixmap()
         x0 = (self.width() - pix.width()) / 2
         y0 = (self.height() - pix.height()) / 2
         painter = QPainter(self)
-        colors = {"logo": "#22c55e", "hook": "#38bdf8", "cta": "#fb923c"}
-        letters = {"logo": "L", "hook": "H", "cta": "C"}
+        if self._active in ("subtitle", "hook", "cta"):
+            left, right, top, bottom = self._safe_margins
+            safe_x = x0 + pix.width() * left
+            safe_y = y0 + pix.height() * top
+            safe_w = pix.width() * max(0.02, 1.0 - left - right)
+            safe_h = pix.height() * max(0.02, 1.0 - top - bottom)
+            pen = QPen(QColor("#38bdf8"), 2)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(
+                int(safe_x), int(safe_y), int(safe_w), int(safe_h))
+        colors = {
+            "subtitle": "#e879f9", "logo": "#22c55e",
+            "hook": "#38bdf8", "cta": "#fb923c"}
+        letters = {"subtitle": "S", "logo": "L", "hook": "H", "cta": "C"}
         for key, (fx, fy) in self._markers.items():
             x = x0 + fx * pix.width(); y = y0 + fy * pix.height()
             width = 4 if key == self._active else 2
@@ -317,6 +339,9 @@ class MainWindow(QMainWindow):
         self.db = db
         self.device = device
         self.config_path = config_path
+        self._saved_editor = deepcopy(cfg.editor)
+        self._settings_dirty = False
+        self._sources = SourceController(self.cfg.download.channels)
         self._scan_worker: ScanWorker | None = None
         self._check_worker: CheckChannelWorker | None = None
         self._manual_worker: ManualDownloadWorker | None = None
@@ -328,14 +353,19 @@ class MainWindow(QMainWindow):
         self.resize(1000, 640)
         db.resume_queue()   # job đang chạy dở lần trước -> Interrupted để tiếp tục
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_download_tab(), "Tải xuống")
+        self._download_idx = self.tabs.addTab(self._build_download_tab(), "Tải xuống")
         # Queue Manager là nơi điều khiển + theo dõi tiến trình edit (driver duy nhất).
-        self._queue_tab = QueueTab(cfg, db, device=device)
+        # Hàng đợi dùng bản cấu hình đã lưu. Các thay đổi trong tab Cài đặt là
+        # bản nháp cho đến khi người dùng bấm "Lưu cài đặt".
+        self._queue_tab = QueueTab(deepcopy(cfg), db, device=device)
         self._queue_tab.data_changed.connect(self._on_queue_data_changed)
         self._queue_tab.edit_progress.connect(self._on_edit_progress)
         self._queue_idx = self.tabs.addTab(self._queue_tab, "Hàng đợi")
         # Tab cài đặt đặt SAU 'Hàng đợi' theo yêu cầu; vẫn dựng đầy đủ nhóm bên trong.
         self.tabs.addTab(self._build_edit_tab(), "Cài đặt video")
+        self._settings_dirty = False
+        self.lbl_edit_save_status.setText("✓ Đã lưu")
+        self.lbl_edit_save_status.setStyleSheet("color:#15803d;")
         self._history_idx = self.tabs.addTab(self._build_history_tab(), "Lịch sử / Xuất bản")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
@@ -358,7 +388,9 @@ class MainWindow(QMainWindow):
                                  on_status=lambda a, b, c: self._bridge.status.emit(a, b, c),
                                  on_progress=lambda a, b, c: self._bridge.progress.emit(a, b, c),
                                  on_downloaded=lambda vid: self._bridge.downloaded.emit(vid))
-        self._auto.start_scheduler()
+        self._apply_download_mode()
+        if self.cfg.download.enabled and self.cfg.download.auto_scan_enabled:
+            self._auto.start_scheduler()
         self._setup_input_folder_watch()
         # Resume an existing edit backlog without waiting for a new download event.
         if self.cfg.editor.auto_edit_after_download:
@@ -406,6 +438,28 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(10, 8, 10, 8)
         lay.setSpacing(6)
 
+        self.download_mode_bar = QWidget()
+        mode_row = QHBoxLayout(self.download_mode_bar)
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        self.chk_download_enabled = QCheckBox("Bật tính năng tải video từ YouTube")
+        self.chk_download_enabled.setChecked(
+            bool(getattr(self.cfg.download, "enabled", True)))
+        self.chk_download_enabled.setToolTip(
+            "Tắt khi chỉ cần nhập và biên tập video có sẵn. "
+            "Tab Hàng đợi và Cài đặt video vẫn hoạt động bình thường.")
+        self.chk_download_enabled.toggled.connect(self._toggle_download_mode)
+        mode_row.addWidget(self.chk_download_enabled)
+        self.lbl_download_mode = QLabel()
+        self.lbl_download_mode.setStyleSheet("color:#64748b;")
+        mode_row.addWidget(self.lbl_download_mode)
+        mode_row.addStretch(1)
+        lay.addWidget(self.download_mode_bar)
+
+        self.download_content = QWidget()
+        content_lay = QVBoxLayout(self.download_content)
+        content_lay.setContentsMargins(0, 0, 0, 0)
+        content_lay.setSpacing(6)
+
         # Hàng 1/2: trạng thái, tổng số, lịch tự động và hành động chính.
         top = QHBoxLayout(); top.setSpacing(8)
         top.addWidget(QLabel("<b>Tải video</b>"))
@@ -418,7 +472,8 @@ class MainWindow(QMainWindow):
         top.addStretch(1)
         self.chk_auto = QCheckBox(
             f"Tự động quét mỗi {self.cfg.download.scan_interval_minutes} phút")
-        self.chk_auto.setChecked(True)
+        self.chk_auto.setChecked(
+            bool(getattr(self.cfg.download, "auto_scan_enabled", False)))
         self.chk_auto.toggled.connect(self._toggle_auto)
         top.addWidget(self.chk_auto)
         self.btn_scan = QPushButton("Quét ngay")
@@ -457,7 +512,7 @@ class MainWindow(QMainWindow):
         self.btn_resume_downloads.clicked.connect(self.on_resume_all_downloads)
         self.btn_resume_downloads.hide()
         top.addWidget(self.btn_resume_downloads)
-        lay.addLayout(top)
+        content_lay.addLayout(top)
 
         # Hàng 2/2: toàn bộ cấu hình thường dùng + tải URL.
         tools = QHBoxLayout(); tools.setSpacing(6)
@@ -508,7 +563,7 @@ class MainWindow(QMainWindow):
         self.btn_manual = QPushButton("Tải video")
         self.btn_manual.clicked.connect(self.on_manual_download)
         tools.addWidget(self.btn_manual)
-        lay.addLayout(tools)
+        content_lay.addLayout(tools)
 
         self.table = QTableWidget(0, len(_COLS))
         self.table.setHorizontalHeaderLabels(_COLS)
@@ -518,7 +573,48 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         make_columns_resizable(
             self.table, [1.0, 4.0, 1.35, 0.9, 1.05, 1.0], min_width=100)
-        lay.addWidget(self.table, 1)
+        content_lay.addWidget(self.table, 1)
+        lay.addWidget(self.download_content, 1)
+
+        self.download_disabled = QFrame()
+        self.download_disabled.setObjectName("downloadDisabledState")
+        self.download_disabled.setStyleSheet(
+            "#downloadDisabledState{background:#f8fafc;border:1px dashed #cbd5e1;"
+            "border-radius:10px;}")
+        disabled_lay = QVBoxLayout(self.download_disabled)
+        disabled_lay.setContentsMargins(24, 24, 24, 24)
+        disabled_lay.addStretch(1)
+        disabled_title = QLabel("Tính năng tải YouTube đang tắt")
+        disabled_title.setAlignment(Qt.AlignCenter)
+        disabled_title.setStyleSheet(
+            "font-size:18px;font-weight:600;color:#0f172a;")
+        disabled_lay.addWidget(disabled_title)
+        disabled_desc = QLabel(
+            "Ứng dụng đang ở chế độ xử lý video có sẵn trên máy.\n"
+            "Bạn có thể nhập video hoặc cả thư mục trực tiếp vào Hàng đợi.")
+        disabled_desc.setWordWrap(True)
+        disabled_desc.setAlignment(Qt.AlignCenter)
+        disabled_desc.setStyleSheet("color:#64748b;margin:4px 0 10px 0;")
+        disabled_lay.addWidget(disabled_desc)
+        disabled_actions = QHBoxLayout()
+        disabled_actions.addStretch(1)
+        btn_enable_download = QPushButton("Bật tải YouTube")
+        btn_enable_download.setStyleSheet(
+            "background:#2563eb;color:white;font-weight:600;border-color:#2563eb;")
+        btn_enable_download.clicked.connect(
+            lambda: self.chk_download_enabled.setChecked(True))
+        disabled_actions.addWidget(btn_enable_download)
+        btn_local_video = QPushButton("Nhập video")
+        btn_local_video.clicked.connect(self._open_queue_import_video)
+        disabled_actions.addWidget(btn_local_video)
+        btn_local_folder = QPushButton("Nhập thư mục")
+        btn_local_folder.clicked.connect(self._open_queue_import_folder)
+        disabled_actions.addWidget(btn_local_folder)
+        disabled_actions.addStretch(1)
+        disabled_lay.addLayout(disabled_actions)
+        disabled_lay.addStretch(1)
+        lay.addWidget(self.download_disabled, 1)
+        self._apply_download_mode()
         return w
 
     def _update_range_summary(self) -> str:
@@ -707,11 +803,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _valid_channel_ref(ref: str) -> bool:
-        low = ref.lower().strip()
-        return ((ref.startswith("UC") and len(ref) == 24 and " " not in ref) or
-                (ref.startswith("@") and len(ref) > 1 and " " not in ref) or
-                (low.startswith(("http://", "https://")) and
-                 ("youtube.com/" in low or "youtu.be/" in low)))
+        return SourceController.valid_reference(ref)
 
     def _channel_from_form(self) -> tuple[str, str] | None:
         name = self.le_ch_name.text().strip()
@@ -729,15 +821,13 @@ class MainWindow(QMainWindow):
         values = self._channel_from_form()
         if not values: return
         name, ref = values
-        refs = {c.channel_id or c.url for c in self.cfg.download.channels}
-        if ref in refs:
+        try:
+            change = self._sources.add(name, ref)
+        except SourceError:
             QMessageBox.information(self, "Nguồn đã tồn tại", "Địa chỉ này đã có trong danh sách theo dõi.")
             return
         # channel_id nếu người dùng dán thẳng UC...; ngược lại coi là url/handle để resolve khi quét
-        is_id = ref.startswith("UC") and len(ref) == 24 and " " not in ref
-        ch = ChannelCfg(name=name or ref, url="" if is_id else ref,
-                        channel_id=ref if is_id else "")
-        self.cfg.download.channels.append(ch)
+        ch = change.channel
         self.le_ch_name.clear(); self.le_ch_url.clear()
         self._reload_channel_list()
         self.lbl_channels.setText(self._channels_summary())
@@ -751,14 +841,11 @@ class MainWindow(QMainWindow):
         values = self._channel_from_form()
         if not values: return
         name, ref = values
-        duplicate = any(i != idx and (c.channel_id or c.url) == ref
-                        for i, c in enumerate(self.cfg.download.channels))
-        if duplicate:
+        try:
+            self._sources.update(idx, name, ref)
+        except SourceError:
             QMessageBox.information(self, "Nguồn đã tồn tại", "Địa chỉ này đã có trong danh sách theo dõi.")
             return
-        is_id = ref.startswith("UC") and len(ref) == 24 and " " not in ref
-        self.cfg.download.channels[idx] = ChannelCfg(
-            name=name, url="" if is_id else ref, channel_id=ref if is_id else "")
         self._save_cfg(); self._reload_channel_list()
         self._log_dl(f"Đã cập nhật nguồn: {name} ({ref}).")
 
@@ -770,7 +857,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "Xóa nguồn theo dõi",
                                 f"Xóa ‘{chans[idx].name}’ khỏi danh sách theo dõi?") != QMessageBox.Yes:
             return
-        removed = chans.pop(idx)
+        removed = self._sources.remove(idx)
         self._reload_channel_list()
         self.lbl_channels.setText(self._channels_summary())
         self.btn_sources.setText(f"Nguồn ({len(self.cfg.download.channels)})")
@@ -863,17 +950,9 @@ class MainWindow(QMainWindow):
         # Giữ label ẩn để các callback cũ tiếp tục tương thích.
         self.lbl_edit_summary = QLabel(self._edit_summary()); self.lbl_edit_summary.hide()
 
-        # Header cố định: preset, output và preview luôn nhìn thấy.
+        # Header cố định: thư mục xuất và trạng thái lưu luôn nhìn thấy.
         header = QHBoxLayout(); header.setSpacing(6)
         header.addWidget(QLabel("<b>Cài đặt biên tập</b>"))
-        header.addWidget(QLabel("Preset:"))
-        self.cmb_preset = QComboBox()
-        for name, p in PLATFORM_PRESETS.items():
-            self.cmb_preset.addItem(p["label"], name)
-        header.addWidget(self.cmb_preset)
-        btn_preset = QPushButton("Áp dụng")
-        btn_preset.clicked.connect(self.on_apply_preset)
-        header.addWidget(btn_preset)
         header.addWidget(QLabel("Xuất:"))
         self.lbl_output = QLabel(self.cfg.editor.output_dir)
         self.lbl_output.setMaximumWidth(260)
@@ -886,9 +965,10 @@ class MainWindow(QMainWindow):
         self.lbl_edit_save_status = QLabel("✓ Đã lưu")
         self.lbl_edit_save_status.setStyleSheet("color:#15803d;")
         header.addWidget(self.lbl_edit_save_status)
-        btn_prev = QPushButton("Xem trước")
-        btn_prev.clicked.connect(lambda: self.on_preview(batch=False))
-        header.addWidget(btn_prev)
+        self.btn_save_editor = QPushButton("Lưu cài đặt")
+        self.btn_save_editor.setStyleSheet("font-weight:600;")
+        self.btn_save_editor.clicked.connect(self.on_save_editor_settings)
+        header.addWidget(self.btn_save_editor)
         lay.addLayout(header)
 
         # Trang Cơ bản.
@@ -955,6 +1035,18 @@ class MainWindow(QMainWindow):
                          "long_video_segment_minutes", "Chia video dài")
         bform.addRow("Video dài hơn 10 phút", self.cmb_long_video_split)
 
+        self.chk_auto_edit_new = QCheckBox(
+            "Tự động bắt đầu biên tập khi có video mới")
+        self.chk_auto_edit_new.setChecked(
+            bool(self.cfg.editor.auto_edit_after_download))
+        self.chk_auto_edit_new.setToolTip(
+            "Áp dụng cho video vừa tải và video mới trong thư mục theo dõi. "
+            "Tắt để chỉ đưa video vào Hàng đợi và tự bấm Bắt đầu khi sẵn sàng.")
+        self._bind_bool(
+            self.chk_auto_edit_new, self.cfg.editor,
+            "auto_edit_after_download", "Tự động xử lý video mới")
+        bform.addRow("Luồng tự động", self.chk_auto_edit_new)
+
         self.chk_make_short = QCheckBox("Xuất thêm một video ngắn")
         self.chk_make_short.setChecked(bool(self.cfg.editor.export.make_short))
         self.chk_make_short.setToolTip(
@@ -965,13 +1057,29 @@ class MainWindow(QMainWindow):
 
         self.short_options = QGroupBox("Tùy chọn video ngắn")
         short_form = QFormLayout(self.short_options)
-        self.sp_short_seconds = self._spin(
-            QSpinBox, 10, 300, int(self.cfg.editor.export.short_seconds), 5)
-        self.sp_short_seconds.setSuffix(" giây")
-        self._bind_int(
-            self.sp_short_seconds, self.cfg.editor.export, "short_seconds",
-            "Thời lượng video ngắn")
-        short_form.addRow("Thời lượng", self.sp_short_seconds)
+        self.cmb_short_seconds = QComboBox()
+        current_short_seconds = int(self.cfg.editor.export.short_seconds)
+        common_durations = (15, 30, 45, 60, 90, 120)
+        if current_short_seconds not in common_durations:
+            self.cmb_short_seconds.addItem(
+                f"Đang dùng · {current_short_seconds} giây",
+                current_short_seconds)
+        for seconds in common_durations:
+            suffix = "phút" if seconds % 60 == 0 else "giây"
+            amount = seconds // 60 if suffix == "phút" else seconds
+            label = f"{amount} {suffix}"
+            if seconds == 60:
+                label += " · phổ biến"
+            self.cmb_short_seconds.addItem(label, seconds)
+        self.cmb_short_seconds.addItem("Tùy chọn…", "custom")
+        self.cmb_short_seconds.setCurrentIndex(
+            max(0, self.cmb_short_seconds.findData(current_short_seconds)))
+        self._last_short_seconds = current_short_seconds
+        self.cmb_short_seconds.currentIndexChanged.connect(
+            self._on_short_duration_changed)
+        self.cmb_short_seconds.setToolTip(
+            "Chọn nhanh thời lượng phổ biến hoặc dùng Tùy chọn để nhập từ 10–300 giây.")
+        short_form.addRow("Thời lượng", self.cmb_short_seconds)
         self.cmb_shortmode = self._data_combo(
             [("start", "Lấy từ đầu video"),
              ("highlight", "Tự chọn đoạn sôi động nhất")],
@@ -991,11 +1099,9 @@ class MainWindow(QMainWindow):
         self.lbl_short_speed_hint.setStyleSheet("color:#15803d;")
         self.lbl_short_speed_hint.setVisible(not self.cfg.editor.export.make_short)
         bform.addRow("", self.lbl_short_speed_hint)
-        hint = QLabel("Preset thiết lập nhanh tỉ lệ, thời lượng short và vùng an toàn phụ đề.")
-        hint.setWordWrap(True); hint.setStyleSheet("color:#64748b;")
-        bform.addRow("", hint)
-
-        nav = QListWidget(); nav.setMaximumWidth(175)
+        nav = QListWidget()
+        nav.setMinimumWidth(125)
+        nav.setMaximumWidth(155)
         nav.setStyleSheet("QListWidget::item { min-height: 34px; padding: 4px 10px; }")
         nav.addItems(["Cơ bản", "Hình ảnh", "Âm thanh", "Phụ đề & dịch", "Thương hiệu"])
         nav.setCurrentRow(0)
@@ -1020,15 +1126,19 @@ class MainWindow(QMainWindow):
         preview_box = QGroupBox("Xem trước")
         pv = QVBoxLayout(preview_box)
         self.lbl_live_preview = _InteractivePreview(
-            "Chọn “Xem trước” để tạo khung hình\n\nSau đó chọn Logo/Hook/CTA và click\ntrực tiếp lên ảnh để đặt vị trí")
+            "Bấm “Tạo xem trước” để tạo khung hình\n\n"
+            "Nếu chưa chọn thư mục nguồn, ứng dụng dùng video đang xử lý "
+            "hoặc đang chọn trong Hàng đợi.")
         self.lbl_live_preview.clicked.connect(self._on_inline_position_click)
-        self.lbl_live_preview.setMinimumSize(340, 390)
+        self.lbl_live_preview.setMinimumSize(260, 220)
         self.lbl_live_preview.setStyleSheet(
             "background:#0f172a;color:#cbd5e1;border-radius:6px;padding:12px;")
+        self._on_subtitle_safe_frame_changed()
         pv.addWidget(self.lbl_live_preview, 1)
         position_row = QHBoxLayout()
         position_row.addWidget(QLabel("Đặt vị trí:"))
         self.cmb_preview_target = QComboBox()
+        self.cmb_preview_target.addItem("Phụ đề", "subtitle")
         self.cmb_preview_target.addItem("Logo", "logo")
         self.cmb_preview_target.addItem("Hook", "hook")
         self.cmb_preview_target.addItem("CTA", "cta")
@@ -1037,51 +1147,60 @@ class MainWindow(QMainWindow):
         self.lbl_preview_position = QLabel("Click lên ảnh")
         self.lbl_preview_position.setStyleSheet("color:#64748b;")
         position_row.addWidget(self.lbl_preview_position, 1)
+        btn_refresh = QPushButton("Xem trước bản nháp")
+        btn_refresh.setToolTip(
+            "Tạo một khung hình theo đúng cấu hình hiện tại. "
+            "Xử lý nhiều video được thực hiện trong tab Hàng đợi.")
+        btn_refresh.clicked.connect(lambda: self.on_preview(batch=False))
+        position_row.addWidget(btn_refresh)
         pv.addLayout(position_row)
         ebrand = self.cfg.editor
-        for key, pos in (("logo", ebrand.overlay.position),
+        for key, pos in (("subtitle", ebrand.subtitle.position),
+                         ("logo", ebrand.overlay.position),
                          ("hook", ebrand.intro_hook.position),
                          ("cta", ebrand.outro_cta.position)):
             fx, fy = self._position_point(key, pos)
             self.lbl_live_preview.set_marker(key, fx, fy)
-        self.lbl_live_preview.set_active("logo")
+        self.lbl_live_preview.set_active("subtitle")
         self._on_preview_target_changed()
-        pv_actions = QHBoxLayout()
-        btn_prevb = QPushButton("Xem nhiều video")
-        btn_prevb.clicked.connect(lambda: self.on_preview(batch=True))
-        btn_refresh = QPushButton("Cập nhật preview")
-        btn_refresh.clicked.connect(lambda: self.on_preview(batch=False))
-        pv_actions.addWidget(btn_prevb); pv_actions.addWidget(btn_refresh)
-        pv.addLayout(pv_actions)
-        preview_box.setMinimumWidth(380)
-        preview_box.setMaximumWidth(460)
-        content = QHBoxLayout()
-        content.addWidget(nav); content.addWidget(stack, 1); content.addWidget(preview_box)
-        lay.addLayout(content, 1)
+        preview_box.setMinimumWidth(280)
+        preview_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        settings_host = QWidget()
+        settings_lay = QHBoxLayout(settings_host)
+        settings_lay.setContentsMargins(0, 0, 0, 0)
+        settings_lay.setSpacing(8)
+        settings_lay.addWidget(nav)
+        settings_lay.addWidget(stack, 1)
+        self.edit_splitter = QSplitter(Qt.Horizontal)
+        self.edit_splitter.setChildrenCollapsible(False)
+        self.edit_splitter.addWidget(settings_host)
+        self.edit_splitter.addWidget(preview_box)
+        self.edit_splitter.setStretchFactor(0, 3)
+        self.edit_splitter.setStretchFactor(1, 2)
+        self.edit_splitter.setSizes([700, 430])
+        lay.addWidget(self.edit_splitter, 1)
 
         # Footer cố định: nguồn đầu vào và hành động chạy.
         frow = QHBoxLayout()
-        frow.addWidget(QLabel("Video đầu vào:"))
+        source_label = QLabel("Thư mục theo dõi:")
+        source_label.setToolTip(
+            "Khác với 'Nhập thư mục' trong Hàng đợi: thư mục này được theo dõi "
+            "liên tục và video mới sẽ tự động được thêm.")
+        frow.addWidget(source_label)
         self.lbl_input = QLabel(self.cfg.editor.input_folder or "(chưa chọn)")
         self.lbl_input.setWordWrap(True)
         frow.addWidget(self.lbl_input, 1)
-        btn_pick = QPushButton("Chọn folder…")
+        btn_pick = QPushButton("Chọn thư mục theo dõi…")
+        btn_pick.setToolTip(
+            "Theo dõi liên tục thư mục này. Nếu chỉ muốn thêm một lần, "
+            "hãy dùng 'Nhập thư mục' trong tab Hàng đợi.")
         btn_pick.clicked.connect(self.on_pick_input_folder)
         frow.addWidget(btn_pick)
-        self.btn_edit_folder = QPushButton("Nhập folder vào hàng đợi")
-        self.btn_edit_folder.clicked.connect(self.on_edit_folder)
-        frow.addWidget(self.btn_edit_folder)
-        lay.addLayout(frow)
-
-        self.btn_edit = QPushButton("Thêm video đã tải vào hàng đợi")
-        self.btn_edit.clicked.connect(self.on_edit_clicked)
-        self.btn_edit.setStyleSheet("font-weight:600;")
-        frow.addWidget(self.btn_edit)
         lay.addLayout(frow)
         return root
 
     # ---------------- Tab Lịch sử / Xuất bản ----------------
-    _EXPORT_HDR = ["Video", "Kênh", "Video dài", "Video ngắn", "Nội dung", "Phụ đề", "Thư mục", "Thời gian"]
+    _EXPORT_HDR = ["Video", "Kênh", "Tệp đã xuất", "Thư mục", "Thời gian"]
     _EVENT_HDR = ["Thời gian", "Mức độ", "Nguồn", "Nội dung"]
 
     def _build_history_tab(self) -> QWidget:
@@ -1125,9 +1244,18 @@ class MainWindow(QMainWindow):
         self.history_pages = QTabWidget()
         exports_page = QWidget(); exports_lay = QVBoxLayout(exports_page)
         exports_lay.setContentsMargins(0, 8, 0, 0)
-        exports_hint = QLabel("Các video đã xuất thành công. Bấm đúp một dòng để mở thư mục kết quả.")
-        exports_hint.setStyleSheet("color:#64748b;")
-        exports_lay.addWidget(exports_hint)
+        export_tools = QHBoxLayout()
+        self.exports_hint = QLabel("Các video đã xuất thành công. Bấm đúp một dòng để mở thư mục kết quả.")
+        self.exports_hint.setStyleSheet("color:#64748b;")
+        export_tools.addWidget(self.exports_hint, 1)
+        self.exports_search = QLineEdit()
+        self.exports_search.setPlaceholderText("Tìm video hoặc kênh…")
+        self.exports_search.setClearButtonEnabled(True)
+        self.exports_search.setMaximumWidth(280)
+        self.exports_search.setMinimumWidth(200)
+        self.exports_search.textChanged.connect(self._apply_export_filter)
+        export_tools.addWidget(self.exports_search)
+        exports_lay.addLayout(export_tools)
         self.tbl_exports = QTableWidget(0, len(self._EXPORT_HDR))
         self.tbl_exports.setHorizontalHeaderLabels(self._EXPORT_HDR)
         self.tbl_exports.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1135,8 +1263,8 @@ class MainWindow(QMainWindow):
         self.tbl_exports.setAlternatingRowColors(True); self.tbl_exports.setShowGrid(False)
         self.tbl_exports.cellDoubleClicked.connect(self._open_export_dir)
         make_columns_resizable(
-            self.tbl_exports, [1.7, 1.15, 0.85, 0.85, 0.85, 0.85, 1.15, 1.45],
-            min_width=100)
+            self.tbl_exports, [2.2, 1.2, 1.7, 1.1, 1.45],
+            min_width=80)
         self.lbl_exports_empty = QLabel("Chưa có video nào được xuất bản\nKết quả sẽ xuất hiện tại đây sau khi hoàn thành biên tập.")
         self.lbl_exports_empty.setAlignment(Qt.AlignCenter)
         self.lbl_exports_empty.setStyleSheet("color:#64748b;background:#f8fafc;border:1px dashed #cbd5e1;border-radius:7px;padding:30px;")
@@ -1149,6 +1277,7 @@ class MainWindow(QMainWindow):
         filters = QHBoxLayout()
         self.history_search = QLineEdit(); self.history_search.setPlaceholderText("Tìm trong nội dung…")
         self.history_search.setClearButtonEnabled(True); self.history_search.setMaximumWidth(330)
+        self.history_search.setMinimumWidth(250)
         self.history_search.textChanged.connect(self._apply_event_filters); filters.addWidget(self.history_search)
         self.history_level = QComboBox()
         self.history_level.addItem("Tất cả mức độ", "all")
@@ -1200,18 +1329,46 @@ class MainWindow(QMainWindow):
             self.history_pages.setCurrentIndex(1)
 
     def _fill_exports(self, rows: list[dict]) -> None:
+        self._export_rows = list(rows)
         self.tbl_exports.setRowCount(len(rows))
-        keys = ["video_id", "channel_name", "full_path", "short_path", "content_txt",
-                "srt_path", "output_dir", "exported_at"]
         for row, data in enumerate(rows):
-            for col, key in enumerate(keys):
-                raw = str(data.get(key) or "")
-                shown = ("Có" if raw else "—") if key in {"full_path", "short_path", "content_txt", "srt_path"} else raw
-                item = QTableWidgetItem(shown); item.setToolTip(raw)
-                if key == "output_dir": item.setText("Mở thư mục")
+            files = []
+            for key, label in (("full_path", "Video"), ("short_path", "Short"),
+                               ("content_txt", "Nội dung"), ("srt_path", "SRT")):
+                if data.get(key):
+                    files.append(label)
+            values = [
+                str(data.get("video_id") or ""),
+                str(data.get("channel_name") or ""),
+                " · ".join(files) if files else "—",
+                "Mở thư mục",
+                str(data.get("exported_at") or ""),
+            ]
+            tooltips = [
+                values[0], values[1], values[2],
+                str(data.get("output_dir") or ""), values[4],
+            ]
+            for col, shown in enumerate(values):
+                item = QTableWidgetItem(shown)
+                item.setToolTip(tooltips[col])
                 self.tbl_exports.setItem(row, col, item)
         self.lbl_exports_empty.setVisible(not rows)
         self.tbl_exports.setVisible(bool(rows))
+        self._apply_export_filter()
+        if rows:
+            self.tbl_exports.scrollToTop()
+
+    def _apply_export_filter(self, *_):
+        if not hasattr(self, "tbl_exports"):
+            return
+        query = self.exports_search.text().strip().lower()
+        for row in range(self.tbl_exports.rowCount()):
+            text = " ".join(
+                self.tbl_exports.item(row, col).text()
+                for col in (0, 1, 2)
+                if self.tbl_exports.item(row, col) is not None
+            ).lower()
+            self.tbl_exports.setRowHidden(row, bool(query and query not in text))
 
     def _apply_event_filters(self, *_):
         if not hasattr(self, "_history_events"): return
@@ -1266,7 +1423,7 @@ class MainWindow(QMainWindow):
 
     def _open_export_dir(self, row: int, col: int) -> None:
         """Bấm đúp 1 dòng -> mở thư mục xuất bản (<kênh>/<id>) trong Explorer."""
-        item = self.tbl_exports.item(row, 6)  # cột "Thư mục"
+        item = self.tbl_exports.item(row, 3)  # cột "Thư mục"
         path = (item.toolTip() or item.text()) if item else ""
         if path and os.path.isdir(path):
             try:
@@ -1563,6 +1720,8 @@ class MainWindow(QMainWindow):
     _COOKIE_FILE_ITEM = "Chọn file cookie…"
     # (giá trị codec ffmpeg, nhãn hiển thị)
     _CODECS = [
+        ("h264_qsv", "h264_qsv — GPU Intel Quick Sync (H.264)"),
+        ("hevc_qsv", "hevc_qsv — GPU Intel Quick Sync (H.265/HEVC)"),
         ("h264_nvenc", "h264_nvenc — GPU NVIDIA (H.264)"),
         ("hevc_nvenc", "hevc_nvenc — GPU NVIDIA (H.265/HEVC)"),
         ("libx264", "libx264 — CPU (H.264)"),
@@ -1575,8 +1734,8 @@ class MainWindow(QMainWindow):
             return
         self.cfg.editor.target_aspect = text
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
-        self._log_ed(f"Khung hình đầu ra: {text} — đã lưu, giữ tới khi đổi lại.")
+        self._mark_settings_dirty()
+        self._log_ed(f"Khung hình đầu ra: {text} — đang chờ lưu.")
 
     def _set_sep_row_visible(self, visible: bool) -> None:
         """Ẩn/hiện dòng 'Công nghệ tách giọng' (cả nhãn) theo lựa chọn âm thanh."""
@@ -1617,11 +1776,11 @@ class MainWindow(QMainWindow):
             self.cfg.editor.tts.enabled = False
             self._sync_voiceover_controls()   # ô 'Lồng tiếng' -> 'Không dùng'
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
         names = {"keep": "giữ nguyên âm thanh gốc",
                  "separate": "tách & giữ lời thoại (cần requirements-ml.txt + GPU)",
                  "mute": "xóa hết âm thanh"}
-        self._log_ed(f"Âm thanh đầu ra: {names.get(mode, mode)} — đã lưu.")
+        self._log_ed(f"Âm thanh đầu ra: {names.get(mode, mode)} — đang chờ lưu.")
 
     def _cookie_file_label(self) -> str:
         return f"📄 {Path(self.cfg.download.cookies_file).name}"
@@ -1671,30 +1830,53 @@ class MainWindow(QMainWindow):
             return
         self.cfg.editor.export.video_codec = val
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
-        self._log_ed(f"Codec xuất: {val} — đã lưu, giữ tới khi đổi lại.")
+        self._mark_settings_dirty()
+        self._log_ed(f"Codec xuất: {val} — đang chờ lưu.")
 
     def _on_ai_device_changed(self, idx: int) -> None:
         val = self.cmb_ai_device.itemData(idx) or "auto"
         self.cfg.editor.processing_device = val
-        self.device = val
-        self._queue_tab.device = val
-        # Worker tạo pipeline mới cho từng video; cập nhật này áp dụng từ video kế
-        # tiếp (hoặc ngay bước kế tiếp nếu worker chưa tạo pipeline).
-        if self._queue_tab._worker and self._queue_tab._worker.isRunning():
-            self._queue_tab._worker.device = val
-        self._save_cfg()
+        self._mark_settings_dirty()
         labels = {"auto": "Tự động (GPU lỗi sẽ chuyển CPU)",
                   "cuda": "GPU NVIDIA (CUDA)", "cpu": "CPU"}
-        self._log_ed(f"Thiết bị xử lý AI: {labels.get(val, val)} — đã lưu.")
+        self._log_ed(f"Thiết bị xử lý AI: {labels.get(val, val)} — đang chờ lưu.")
 
     # ---------------- Cài đặt nâng cao ----------------
     def _set_cfg(self, obj, attr: str, value, label: str | None = None) -> None:
         setattr(obj, attr, value)
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
         if label:
-            self._log_ed(f"{label}: {value} — đã lưu, giữ tới khi đổi lại.")
+            self._log_ed(f"{label}: {value} — đang chờ lưu.")
+
+    def _mark_settings_dirty(self) -> None:
+        self._settings_dirty = True
+        if hasattr(self, "lbl_edit_save_status"):
+            self.lbl_edit_save_status.setText("● Chưa lưu")
+            self.lbl_edit_save_status.setStyleSheet("color:#b45309;")
+
+    def on_save_editor_settings(self) -> bool:
+        if not self.config_path:
+            QMessageBox.warning(
+                self, "Không thể lưu", "Ứng dụng chưa có đường dẫn file cấu hình.")
+            return False
+        try:
+            save_config(self.cfg, self.config_path)
+            self._saved_editor = deepcopy(self.cfg.editor)
+            self._queue_tab.cfg.editor = deepcopy(self.cfg.editor)
+            self._queue_tab.device = self.cfg.editor.processing_device
+            if self._queue_tab._worker and self._queue_tab._worker.isRunning():
+                self._queue_tab._worker.device = self.cfg.editor.processing_device
+            self._settings_dirty = False
+            self.lbl_edit_save_status.setText("✓ Đã lưu")
+            self.lbl_edit_save_status.setStyleSheet("color:#15803d;")
+            self._on_preview_target_changed()
+            self._setup_input_folder_watch()
+            self._log_ed("Đã lưu cài đặt; các job bắt đầu sau thời điểm này sẽ dùng cấu hình mới.")
+            return True
+        except Exception as ex:
+            QMessageBox.warning(self, "Lỗi lưu cài đặt", str(ex))
+            return False
 
     def _bind_bool(self, w, obj, attr, label=None):
         w.toggled.connect(lambda v: self._set_cfg(obj, attr, bool(v), label))
@@ -1708,11 +1890,41 @@ class MainWindow(QMainWindow):
         self.short_options.setVisible(bool(enabled))
         self.lbl_short_speed_hint.setVisible(not enabled)
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
         self._log_ed(
-            "Đã bật xuất thêm video ngắn."
+            "Đã bật video ngắn trong bản nháp."
             if enabled else
-            "Đã tắt video ngắn: chỉ xuất bản chỉnh sửa đầy đủ, bỏ lần mã hóa thứ hai.")
+            "Đã tắt video ngắn trong bản nháp: khi lưu sẽ chỉ xuất bản chỉnh sửa đầy đủ.")
+
+    def _on_short_duration_changed(self, index: int) -> None:
+        value = self.cmb_short_seconds.itemData(index)
+        if value == "custom":
+            seconds, accepted = QInputDialog.getInt(
+                self, "Thời lượng video ngắn",
+                "Nhập thời lượng (giây):",
+                int(self._last_short_seconds), 10, 300, 5)
+            if not accepted:
+                self.cmb_short_seconds.blockSignals(True)
+                self.cmb_short_seconds.setCurrentIndex(
+                    max(0, self.cmb_short_seconds.findData(
+                        self._last_short_seconds)))
+                self.cmb_short_seconds.blockSignals(False)
+                return
+            value = int(seconds)
+            custom_index = self.cmb_short_seconds.findData(value)
+            if custom_index < 0:
+                custom_index = self.cmb_short_seconds.count() - 1
+                self.cmb_short_seconds.insertItem(
+                    custom_index, f"Tùy chọn · {value} giây", value)
+            self.cmb_short_seconds.blockSignals(True)
+            self.cmb_short_seconds.setCurrentIndex(custom_index)
+            self.cmb_short_seconds.blockSignals(False)
+        value = int(value)
+        self._last_short_seconds = value
+        self._set_cfg(
+            self.cfg.editor.export, "short_seconds", value,
+            "Thời lượng video ngắn")
+        self.lbl_edit_summary.setText(self._edit_summary())
 
     def _bind_int(self, w, obj, attr, label=None):
         w.valueChanged.connect(lambda v: self._set_cfg(obj, attr, int(v), label))
@@ -1766,41 +1978,168 @@ class MainWindow(QMainWindow):
         ("de", "Deutsch · Đức"), ("th", "ไทย · Thái"),
     ]
 
+    def _subtitle_color_control(
+            self, obj, attr: str, label: str,
+            presets: list[tuple[str, str]]) -> QComboBox:
+        """Danh sách màu phổ biến; tùy chỉnh vẫn có nhưng không yêu cầu nhập mã màu."""
+        combo = QComboBox()
+        current = str(getattr(obj, attr, "#FFFFFF")).upper()
+        values = {value.upper() for value, _name in presets}
+        if current not in values:
+            combo.addItem(f"Đang dùng · {current}", current)
+            combo.setItemData(0, QColor(current), Qt.DecorationRole)
+        for value, name in presets:
+            index = combo.count()
+            value = value.upper()
+            combo.addItem(f"{name} · {value}", value)
+            combo.setItemData(index, QColor(value), Qt.DecorationRole)
+        combo.addItem("Tùy chỉnh…", "__custom__")
+        selected = combo.findData(current)
+        combo.setCurrentIndex(max(0, selected))
+        combo.setToolTip(
+            "Chọn một màu dựng sẵn. Mục Tùy chỉnh mở bảng màu và không cần nhập mã.")
+
+        def select_color(index: int) -> None:
+            value = combo.itemData(index)
+            if value == "__custom__":
+                old = str(getattr(obj, attr, current)).upper()
+                initial = QColor(old)
+                color = QColorDialog.getColor(
+                    initial if initial.isValid() else QColor("#FFFFFF"),
+                    self, label)
+                if not color.isValid():
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(max(0, combo.findData(old)))
+                    combo.blockSignals(False)
+                    return
+                value = color.name().upper()
+                custom_index = combo.findData(value)
+                if custom_index < 0:
+                    custom_index = combo.count() - 1
+                    combo.insertItem(custom_index, f"Tùy chỉnh · {value}", value)
+                    combo.setItemData(custom_index, QColor(value), Qt.DecorationRole)
+                combo.blockSignals(True)
+                combo.setCurrentIndex(custom_index)
+                combo.blockSignals(False)
+            self._set_cfg(obj, attr, str(value).upper(), label)
+            self._mark_preview_stale("subtitle")
+
+        combo.currentIndexChanged.connect(select_color)
+        return combo
+
     def _build_subtitle_group(self) -> QWidget:
         s = self.cfg.editor.subtitle
-        g = QGroupBox("Phụ đề & dịch (lưu ngay vào config)")
+        g = QGroupBox("Phụ đề & dịch")
         form = QFormLayout(g)
 
-        self.chk_sub = QCheckBox("Thêm phụ đề & xuất .srt (mặc định: ngôn ngữ gốc)")
+        self.chk_sub = QCheckBox("Hiển thị phụ đề trên video")
         self.chk_sub.setChecked(s.enabled)
         self._bind_bool(self.chk_sub, s, "enabled", "Phụ đề")
+        self.chk_sub.toggled.connect(
+            lambda on: self._set_cfg(s, "burn_in", bool(on), "Ghi phụ đề lên video"))
         form.addRow("Bật phụ đề", self.chk_sub)
 
         self.cmb_tr = self._data_combo(self._SUB_LANGS, s.translate_to)
         self._bind_combo(self.cmb_tr, s, "translate_to", "Dịch sang")
         form.addRow("Dịch sang (chỉ hiển thị bản dịch)", self.cmb_tr)
 
-        self.chk_burn = QCheckBox("Hiển thị phụ đề lên video")
-        self.chk_burn.setChecked(s.burn_in)
-        self._bind_bool(self.chk_burn, s, "burn_in", "Hiển thị phụ đề")
-        form.addRow("Burn vào video", self.chk_burn)
-
         self.cmb_subpos = self._data_combo(
-            [("bottom", "Dưới"), ("middle", "Giữa"), ("top", "Trên")], s.position)
+            [("blur_bottom", "Vùng mờ phía dưới"),
+             ("bottom", "Sát đáy"), ("middle", "Giữa"), ("top", "Trên")], s.position)
         self._bind_combo(self.cmb_subpos, s, "position", "Vị trí phụ đề")
+        self.cmb_subpos.currentIndexChanged.connect(
+            lambda _i: (
+                self._on_preview_target_changed()
+                if hasattr(self, "cmb_preview_target") else None,
+                self._mark_preview_stale("subtitle"),
+                self._refresh_overlay_warnings(),
+            ))
         form.addRow("Vị trí dòng phụ đề", self.cmb_subpos)
 
-        self.sp_subsize = self._spin(QSpinBox, 12, 72, s.font_size)
+        self.sp_subsize = self._spin(QSpinBox, 8, 72, s.font_size)
         self._bind_int(self.sp_subsize, s, "font_size", "Cỡ chữ phụ đề")
+        self.sp_subsize.setToolTip(
+            "Mặc định 14. Giá trị chỉ có hiệu lực với hàng đợi sau khi bấm "
+            "'Lưu cài đặt'; preset không ghi đè cỡ chữ.")
         self.sp_subsize.valueChanged.connect(
             lambda _v: self._mark_preview_stale("subtitle"))
         form.addRow("Cỡ chữ phụ đề", self.sp_subsize)
 
-        children = (self.cmb_tr, self.chk_burn, self.cmb_subpos, self.sp_subsize)
+        self.sub_font_color = self._subtitle_color_control(
+            s, "font_color", "Chọn màu chữ phụ đề", [
+                ("#FFFFFF", "Trắng"), ("#000000", "Đen"),
+                ("#FFF200", "Vàng"), ("#00E5FF", "Xanh cyan"),
+                ("#7CFF6B", "Xanh lá"), ("#FFB347", "Cam"),
+                ("#FF8FCB", "Hồng"),
+            ])
+        form.addRow("Màu chữ", self.sub_font_color)
+        self.sub_background_color = self._subtitle_color_control(
+            s, "background_color", "Chọn màu nền phụ đề", [
+                ("#000000", "Đen"), ("#FFFFFF", "Trắng"),
+                ("#111827", "Xám đen"), ("#172554", "Xanh navy"),
+                ("#3F1D1D", "Đỏ đậm"), ("#163A2A", "Xanh lá đậm"),
+                ("#1E3A5F", "Xanh dương đậm"),
+            ])
+        form.addRow("Màu nền ô chữ", self.sub_background_color)
+
+        opacity = float(getattr(s, "background_opacity", 0.55))
+        self.sp_sub_background_opacity = self._data_combo([
+            (0.0, "Trong suốt · 0%"),
+            (0.25, "Rất nhẹ · 25%"),
+            (0.40, "Nhẹ · 40%"),
+            (0.50, "Cân bằng · 50%"),
+            (0.55, "Khuyên dùng · 55%"),
+            (0.70, "Đậm · 70%"),
+            (0.85, "Rất đậm · 85%"),
+        ], opacity)
+        self.sp_sub_background_opacity.setToolTip(
+            "Độ rõ của ô nền phụ đề. 50–55% phù hợp với phần lớn video.")
+        self.sp_sub_background_opacity.currentIndexChanged.connect(
+            lambda index: (
+                self._set_cfg(
+                    s, "background_opacity",
+                    float(self.sp_sub_background_opacity.itemData(index)),
+                    "Độ đậm nền phụ đề"),
+                self._mark_preview_stale("subtitle"),
+            ))
+        form.addRow("Độ đậm nền", self.sp_sub_background_opacity)
+
+        margins = QWidget()
+        margin_grid = QGridLayout(margins)
+        margin_grid.setContentsMargins(0, 0, 0, 0)
+        margin_grid.setHorizontalSpacing(8)
+        margin_grid.setVerticalSpacing(6)
+        margin_specs = [
+            ("Trái", "margin_left_percent", 0, 0),
+            ("Phải", "margin_right_percent", 0, 2),
+            ("Trên", "margin_top_percent", 1, 0),
+            ("Dưới", "margin_bottom_percent", 1, 2),
+        ]
+        self.subtitle_margin_spins = {}
+        for text, attr, row, col in margin_specs:
+            spin = self._spin(QSpinBox, 0, 45, int(getattr(s, attr)))
+            spin.setSuffix("%")
+            spin.setSingleStep(1)
+            spin.setToolTip(
+                "Khoảng cách theo % kích thước video đầu ra. "
+                "Khung nét đứt trên preview là vùng an toàn thực tế.")
+            self._bind_int(spin, s, attr, f"Lề phụ đề {text.lower()}")
+            spin.valueChanged.connect(
+                lambda _value: self._on_subtitle_safe_frame_changed())
+            margin_grid.addWidget(QLabel(text), row, col)
+            margin_grid.addWidget(spin, row, col + 1)
+            self.subtitle_margin_spins[attr] = spin
+        form.addRow("Khung an toàn phụ đề", margins)
+
+        children = (
+            self.cmb_tr, self.cmb_subpos, self.sp_subsize,
+            self.sub_font_color, self.sub_background_color,
+            self.sp_sub_background_opacity, margins)
         for widget in children:
             widget.setEnabled(s.enabled)
         self.chk_sub.toggled.connect(
             lambda on: [widget.setEnabled(on) for widget in children])
+        self.chk_sub.toggled.connect(lambda _on: self._refresh_overlay_warnings())
         # 'Lồng tiếng' đã chuyển sang tab Âm thanh. Ngôn ngữ đọc Edge TTS bám theo
         # 'Dịch sang', nên đồng bộ lại khi bật/tắt phụ đề hoặc đổi ngôn ngữ dịch.
         self.chk_sub.toggled.connect(lambda _on: self._sync_voiceover_controls())
@@ -1900,9 +2239,9 @@ class MainWindow(QMainWindow):
             self._log_ed("Đã tắt 'Xóa hết âm thanh' để giữ giọng lồng tiếng.")
         self._apply_voiceover_mode(mode)        # theo mode đã chọn (giữ hộp file khi chưa chọn file)
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
         names = {"none": "không dùng", "tts": "Edge TTS tự đọc", "file": "file thu sẵn"}
-        self._log_ed(f"Lồng tiếng: {names.get(mode, mode)} — đã lưu.")
+        self._log_ed(f"Lồng tiếng: {names.get(mode, mode)} — đang chờ lưu.")
 
     def _on_tts_filter_changed(self, attr: str, value: str) -> None:
         self._set_cfg(self.cfg.editor.tts, attr, value)
@@ -1964,14 +2303,14 @@ class MainWindow(QMainWindow):
         self.cmb_tts_voice.blockSignals(False)
         if current and selected == 0 and self._edge_voices:
             self.cfg.editor.tts.voice = ""
-            self._save_cfg()
+            self._mark_settings_dirty()
 
     def _bind_text(self, w, obj, attr, label=None):
         w.editingFinished.connect(lambda: self._set_cfg(obj, attr, w.text(), label))
 
     def _after_cfg_change(self) -> None:
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
 
     def _path_row(self, obj, attr, title, filt):
         holder = QWidget()
@@ -2013,15 +2352,56 @@ class MainWindow(QMainWindow):
             chka.setChecked(tcfg.auto)
             self._bind_bool(chka, tcfg, "auto")
             form.addRow("Tự động", chka); children.append(chka)
+        style = self._data_combo([
+            ("minimal", "Tối giản · chữ có viền"),
+            ("soft_box", "Nền mờ · dễ đọc"),
+            ("highlight", "Nổi bật · chữ vàng"),
+            ("title_bar", "Thanh nhấn · nền đậm"),
+            ("custom", "Tùy chỉnh"),
+        ], getattr(tcfg, "style_preset", "soft_box"))
+        self._bind_combo(style, tcfg, "style_preset", f"Mẫu {prefix}")
+        style.currentIndexChanged.connect(
+            lambda _i, k=key: self._mark_preview_stale(k))
+        form.addRow("Mẫu hiển thị", style); children.append(style)
         cmb = self._data_combo([("top", "Trên"), ("middle", "Giữa"), ("bottom", "Dưới")],
                                tcfg.position)
         self._bind_combo(cmb, tcfg, "position")
         cmb.currentIndexChanged.connect(lambda _i, k=key, c=cmb: self._on_brand_combo_position(k, c))
         self._pos_combos[key] = cmb
         form.addRow("Vị trí", cmb); children.append(cmb)
-        sp = self._spin(QDoubleSpinBox, 0.5, 60.0, tcfg.seconds, 0.5)
-        self._bind_float(sp, tcfg, "seconds")
-        form.addRow("Thời gian hiển thị (giây)", sp); children.append(sp)
+        durations = [2, 3, 4, 5] if is_hook else [3, 5, 7, 10]
+        duration = QComboBox()
+        current_seconds = float(tcfg.seconds)
+        if current_seconds not in durations:
+            duration.addItem(f"Đang dùng · {current_seconds:g} giây", current_seconds)
+        for seconds in durations:
+            duration.addItem(f"{seconds} giây", float(seconds))
+        duration.addItem("Tùy chọn…", "custom")
+        duration.setCurrentIndex(max(0, duration.findData(current_seconds)))
+
+        def change_duration(index, combo=duration, obj=tcfg, name=prefix):
+            value = combo.itemData(index)
+            if value == "custom":
+                value, accepted = QInputDialog.getDouble(
+                    self, f"Thời lượng {name}", "Nhập thời lượng (giây):",
+                    float(obj.seconds), 0.5, 60.0, 1)
+                if not accepted:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(max(0, combo.findData(float(obj.seconds))))
+                    combo.blockSignals(False)
+                    return
+                found = combo.findData(float(value))
+                if found < 0:
+                    found = combo.count() - 1
+                    combo.insertItem(found, f"Tùy chọn · {value:g} giây", float(value))
+                combo.blockSignals(True)
+                combo.setCurrentIndex(found)
+                combo.blockSignals(False)
+            self._set_cfg(obj, "seconds", float(value), f"Thời lượng {name}")
+            self._refresh_overlay_warnings()
+
+        duration.currentIndexChanged.connect(change_duration)
+        form.addRow("Thời gian hiển thị", duration); children.append(duration)
         spf = self._spin(QSpinBox, 16, 96, tcfg.font_size)
         self._bind_int(spf, tcfg, "font_size")
         spf.valueChanged.connect(lambda _v, k=key: self._mark_preview_stale(k))
@@ -2029,10 +2409,42 @@ class MainWindow(QMainWindow):
         chkb = QCheckBox("Nền hộp cho dễ đọc")
         chkb.setChecked(tcfg.box)
         self._bind_bool(chkb, tcfg, "box")
-        form.addRow("Nền chữ", chkb); children.append(chkb)
+        form.addRow("Nền chữ (mẫu tùy chỉnh)", chkb); children.append(chkb)
+        safe = self._data_combo([
+            (0, "Không lề · 0%"), (3, "Mỏng · 3%"),
+            (5, "An toàn · 5%"), (8, "Rộng · 8%"),
+            (10, "Rất rộng · 10%"),
+        ], int(getattr(tcfg, "safe_margin_percent", 5)))
+        safe.setToolTip(
+            "Khoảng cách của chữ Hook/CTA với mép video. "
+            "Không thêm lề đen và không thay đổi kích thước hình ảnh.")
+        self._bind_combo(safe, tcfg, "safe_margin_percent", f"Cách mép chữ {prefix}")
+        safe.currentIndexChanged.connect(
+            lambda _i, k=key: (
+                self._sync_overlay_safe_frame(k),
+                self._mark_preview_stale(k)))
+        form.addRow("Cách mép chữ", safe); children.append(safe)
+        warning = QLabel()
+        warning.setWordWrap(True)
+        warning.setStyleSheet(
+            "color:#9a6700;background:#fff8c5;border-radius:4px;padding:5px;")
+        warning.setVisible(False)
+        if not hasattr(self, "_overlay_warning_labels"):
+            self._overlay_warning_labels = {}
+        self._overlay_warning_labels[key] = warning
+        form.addRow("", warning)
         for widget in children:
             widget.setEnabled(tcfg.enabled)
         chk.toggled.connect(lambda on, ws=children: [w.setEnabled(on) for w in ws])
+        chk.toggled.connect(lambda _on: self._refresh_overlay_warnings())
+        cmb.currentIndexChanged.connect(lambda _i: self._refresh_overlay_warnings())
+
+        def sync_custom_controls():
+            chkb.setEnabled(bool(tcfg.enabled) and style.currentData() == "custom")
+
+        style.currentIndexChanged.connect(lambda _i: sync_custom_controls())
+        chk.toggled.connect(lambda _on: sync_custom_controls())
+        sync_custom_controls()
 
     def _build_hook_cta_logo_group(self) -> QWidget:
         e = self.cfg.editor
@@ -2052,6 +2464,8 @@ class MainWindow(QMainWindow):
         self._bind_combo(self.cmb_logopos, ov, "position", "Vị trí logo")
         self.cmb_logopos.currentIndexChanged.connect(
             lambda _i: self._on_brand_combo_position("logo", self.cmb_logopos))
+        self.cmb_logopos.currentIndexChanged.connect(
+            lambda _i: self._refresh_overlay_warnings())
         form.addRow("Vị trí logo", self.cmb_logopos)
         self.sp_logoscale = self._spin(QDoubleSpinBox, 0.0, 0.5, ov.scale, 0.01)
         self._bind_float(self.sp_logoscale, ov, "scale", "Size logo")
@@ -2066,6 +2480,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(ov.enabled)
         self.chk_logo.toggled.connect(
             lambda on: [widget.setEnabled(on) for widget in logo_children])
+        self.chk_logo.toggled.connect(lambda _on: self._refresh_overlay_warnings())
         tabs.addTab(logo_page, "Logo")
 
         hook_page = QWidget(); hook_form = QFormLayout(hook_page)
@@ -2078,6 +2493,7 @@ class MainWindow(QMainWindow):
         tabs.currentChanged.connect(
             lambda i: self.cmb_preview_target.setCurrentIndex(i)
             if hasattr(self, "cmb_preview_target") else None)
+        self._refresh_overlay_warnings()
         return tabs
 
     def _audio_file_row(self, attr: str):
@@ -2107,13 +2523,13 @@ class MainWindow(QMainWindow):
         setattr(self.cfg.editor.audio, attr, f)
         lbl.setText(f)
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
 
     def _clear_audio_file(self, attr: str, lbl: QLabel) -> None:
         setattr(self.cfg.editor.audio, attr, "")
         lbl.setText("(không)")
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
+        self._mark_settings_dirty()
 
     def _build_video_settings_group(self) -> QWidget:
         e, cg = self.cfg.editor, self.cfg.editor.color_grading
@@ -2389,7 +2805,10 @@ class MainWindow(QMainWindow):
         form.addRow("Độ cao giọng", self.sp_pitch)
         self.sp_aspeed = self._spin(QDoubleSpinBox, 0.25, 4.0, a.audio_speed, 0.05)
         self._bind_float(self.sp_aspeed, a, "audio_speed", "Tốc độ audio")
-        form.addRow("Tốc độ âm thanh", self.sp_aspeed)
+        self.sp_aspeed.setToolTip(
+            "Chỉ áp dụng cho file âm thanh mới hoặc Edge TTS thay thế âm thanh cũ. "
+            "Nếu giữ âm thanh gốc, âm thanh tự bám theo tốc độ video.")
+        form.addRow("Tốc độ âm thanh mới", self.sp_aspeed)
         self.sp_mvol = self._spin(QDoubleSpinBox, 0.0, 1.0, a.music_volume, 0.05)
         self._bind_float(self.sp_mvol, a, "music_volume", "Âm lượng nhạc nền")
         form.addRow("Âm lượng nhạc nền", self.sp_mvol)
@@ -2404,7 +2823,7 @@ class MainWindow(QMainWindow):
         e = self.cfg.editor
         cg = e.color_grading
         a = e.audio
-        g = QGroupBox("Cài đặt nâng cao (lưu ngay vào config)")
+        g = QGroupBox("Cài đặt nâng cao")
         form = QFormLayout(g)
 
         # --- Video ---
@@ -2451,8 +2870,11 @@ class MainWindow(QMainWindow):
         self.chk_duck.setChecked(a.duck_music)
         self._bind_bool(self.chk_duck, a, "duck_music", "Ducking nhạc nền")
         form.addRow("Ducking", self.chk_duck)
-        self.chk_fp = QCheckBox("Fingerprint: biến đổi nhẹ mỗi video (chống trùng)")
+        self.chk_fp = QCheckBox("Fingerprint: biến đổi kỹ thuật nhẹ mỗi video")
         self.chk_fp.setChecked(e.fingerprint_enabled)
+        self.chk_fp.setToolTip(
+            "Thay đổi rất nhẹ tốc độ, FPS, màu, zoom và trạng thái lật theo từng video. "
+            "Không làm thay đổi quyền sử dụng nội dung hoặc bảo đảm kết quả Content ID.")
         self._bind_bool(self.chk_fp, e, "fingerprint_enabled", "Fingerprint")
         form.addRow("Chống trùng", self.chk_fp)
         self.sp_pitch = self._spin(QSpinBox, -12, 12, a.pitch_shift_semitones)
@@ -2460,7 +2882,9 @@ class MainWindow(QMainWindow):
         form.addRow("Pitch shift (nửa cung)", self.sp_pitch)
         self.sp_aspeed = self._spin(QDoubleSpinBox, 0.25, 4.0, a.audio_speed, 0.05)
         self._bind_float(self.sp_aspeed, a, "audio_speed", "Tốc độ audio")
-        form.addRow("Tốc độ audio (thêm)", self.sp_aspeed)
+        self.sp_aspeed.setToolTip(
+            "Chỉ dùng cho voiceover/TTS hoặc âm thanh mới thay hoàn toàn âm thanh cũ.")
+        form.addRow("Tốc độ âm thanh mới", self.sp_aspeed)
         self.sp_mvol = self._spin(QDoubleSpinBox, 0.0, 1.0, a.music_volume, 0.05)
         self._bind_float(self.sp_mvol, a, "music_volume", "Âm lượng nhạc nền")
         form.addRow("Âm lượng nhạc thay (0..1)", self.sp_mvol)
@@ -2552,17 +2976,17 @@ class MainWindow(QMainWindow):
         self._sync_voiceover_controls()    # ô 'Lồng tiếng' theo config sau khi reset voiceover
 
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
-        self._log_ed("Đã khôi phục cài đặt nâng cao về mặc định.")
+        self._mark_settings_dirty()
+        self._log_ed("Đã khôi phục cài đặt nâng cao về bản nháp mặc định; chưa lưu.")
 
     def _save_cfg(self) -> bool:
+        """Save download/source settings without accidentally committing editor draft."""
         if not self.config_path:
             return False
         try:
-            save_config(self.cfg, self.config_path)
-            if hasattr(self, "lbl_edit_save_status"):
-                self.lbl_edit_save_status.setText("✓ Đã lưu")
-                self.lbl_edit_save_status.setStyleSheet("color:#15803d;")
+            snapshot = deepcopy(self.cfg)
+            snapshot.editor = deepcopy(self._saved_editor)
+            save_config(snapshot, self.config_path)
             return True
         except Exception as ex:
             QMessageBox.warning(self, "Lỗi lưu config", str(ex))
@@ -2587,8 +3011,8 @@ class MainWindow(QMainWindow):
         self.cfg.editor.output_dir = d
         self.lbl_output.setText(d)
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
-        self._log_ed(f"Đã đổi thư mục xuất: {d}")
+        self._mark_settings_dirty()
+        self._log_ed(f"Đã chọn thư mục xuất: {d} — đang chờ lưu.")
 
     @staticmethod
     def _set_combo_data(w, value) -> None:
@@ -2597,42 +3021,45 @@ class MainWindow(QMainWindow):
                 w.blockSignals(True); w.setCurrentIndex(i); w.blockSignals(False)
                 return
 
-    def on_apply_preset(self) -> None:
-        name = self.cmb_preset.currentData()
-        if not apply_platform_preset(self.cfg, name):
-            return
-        e = self.cfg.editor
-        self.cmb_aspect.blockSignals(True)
-        self.cmb_aspect.setCurrentText(e.target_aspect)
-        self.cmb_aspect.blockSignals(False)
-        self._set_combo_data(self.cmb_subpos, e.subtitle.position)
-        self.sp_subsize.blockSignals(True); self.sp_subsize.setValue(e.subtitle.font_size)
-        self.sp_subsize.blockSignals(False)
-        if hasattr(self, "sp_short_seconds"):
-            self.sp_short_seconds.blockSignals(True)
-            self.sp_short_seconds.setValue(e.export.short_seconds)
-            self.sp_short_seconds.blockSignals(False)
-        self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
-        self._log_ed(f"Đã áp preset '{name}': khung {e.target_aspect}, short {e.export.short_seconds}s.")
-
     def _downloaded_videos(self) -> list[str]:
         return [r.download_path for r in self.db.all_videos()
                 if r.download_status == "downloaded" and r.download_path
                 and Path(r.download_path).exists()]
 
+    def _downloaded_preview_items(self) -> list[tuple[str, str]]:
+        folder = (self.cfg.editor.input_folder or "").strip()
+        if folder:
+            local_items = [
+                (video_id_for(path), str(path))
+                for path in list_videos(folder)
+            ]
+            if local_items:
+                return local_items
+        if hasattr(self, "_queue_tab"):
+            current = self._queue_tab.preview_source()
+            if current:
+                return [current]
+        return [(r.video_id, r.download_path) for r in self.db.all_videos()
+                if r.download_status == "downloaded" and r.download_path
+                and Path(r.download_path).exists()]
+
     def on_preview(self, batch: bool = False) -> None:
-        vids = self._downloaded_videos()
-        if not vids:
-            QMessageBox.information(self, "Chưa có video", "Cần ít nhất 1 video đã tải để xem trước.")
+        items = self._downloaded_preview_items()
+        if not items:
+            QMessageBox.information(
+                self, "Chưa có video xem trước",
+                "Hãy chọn thư mục theo dõi có video, hoặc chọn một video trong tab Hàng đợi.")
             return
+        video_ids = [item[0] for item in items]
+        vids = [item[1] for item in items]
         out_dir = str(Path(self.cfg.editor.output_dir) / "_previews")
         target = (self.cmb_preview_target.currentData()
                   if hasattr(self, "cmb_preview_target") else "logo")
         try:
             if batch:
                 res = preview.preview_batch(
-                    self.cfg, vids, out_dir, at_seconds=1.0, overlay_target=target)
+                    self.cfg, vids, out_dir, at_seconds=1.0, overlay_target=target,
+                    video_ids=video_ids)
                 ok = sum(r["ok"] for r in res)
                 self._log_ed(f"Xem trước hàng loạt: {ok}/{len(res)} ảnh -> {out_dir}")
                 if os.path.isdir(out_dir):
@@ -2641,7 +3068,8 @@ class MainWindow(QMainWindow):
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
                 png = str(Path(out_dir) / "preview.png")
                 preview.preview_frame(
-                    self.cfg, vids[0], png, at_seconds=1.0, overlay_target=target)
+                    self.cfg, vids[0], png, at_seconds=1.0, overlay_target=target,
+                    video_id=video_ids[0])
                 self._log_ed(f"Xem trước: {png}")
                 if hasattr(self, "lbl_live_preview"):
                     pix = QPixmap(png)
@@ -2654,12 +3082,23 @@ class MainWindow(QMainWindow):
     def _on_inline_position_click(self, fx: float, fy: float) -> None:
         """Đặt Logo/Hook/CTA trực tiếp trên preview, không mở modal riêng."""
         target = self.cmb_preview_target.currentData()
-        if hasattr(self, "brand_tabs"):
+        if hasattr(self, "brand_tabs") and target in ("logo", "hook", "cta"):
             wanted = {"logo": 0, "hook": 1, "cta": 2}.get(target, 0)
             if self.brand_tabs.currentIndex() != wanted:
                 self.brand_tabs.setCurrentIndex(wanted)
         e = self.cfg.editor
-        if target == "logo":
+        if target == "subtitle":
+            pos = (
+                "top" if fy < 0.28 else
+                "middle" if fy < 0.58 else
+                "blur_bottom" if fy < 0.82 else
+                "bottom")
+            e.subtitle.position = pos
+            self._set_combo_data(self.cmb_subpos, pos)
+            label = {
+                "top": "Trên", "middle": "Giữa", "bottom": "Sát đáy",
+                "blur_bottom": "Vùng mờ phía dưới"}[pos]
+        elif target == "logo":
             pos = ("top" if fy < 0.5 else "bottom") + "-" + (
                 "left" if fx < 0.5 else "right")
             e.overlay.position = pos
@@ -2676,9 +3115,10 @@ class MainWindow(QMainWindow):
                 self._set_combo_data(combo, pos)
             label = {"top": "Trên", "middle": "Giữa", "bottom": "Dưới"}[pos]
         self.lbl_live_preview.set_marker(target, fx, fy)
-        self.lbl_preview_position.setText(f"{label} · đã lưu")
-        self._save_cfg()
-        self._log_ed(f"Đặt {target} trực tiếp trên preview: {pos}")
+        self.lbl_preview_position.setText(f"{label} · chưa lưu")
+        self._refresh_overlay_warnings()
+        self._mark_settings_dirty()
+        self._log_ed(f"Đặt {target} trực tiếp trên preview: {pos} — đang chờ lưu.")
 
     @staticmethod
     def _position_point(target: str, pos: str) -> tuple[float, float]:
@@ -2688,26 +3128,99 @@ class MainWindow(QMainWindow):
                 "bottom-left": (0.15, 0.88), "bottom-right": (0.85, 0.88),
             }.get(pos, (0.85, 0.12))
         return {"top": (0.5, 0.15), "middle": (0.5, 0.5),
-                "bottom": (0.5, 0.85)}.get(pos, (0.5, 0.85))
+                "bottom": (0.5, 0.85), "blur_bottom": (0.5, 0.72)
+                }.get(pos, (0.5, 0.85))
 
     def _on_preview_target_changed(self, _index: int = 0) -> None:
         if not hasattr(self, "lbl_live_preview"):
             return
         target = self.cmb_preview_target.currentData()
         e = self.cfg.editor
-        pos = (e.overlay.position if target == "logo" else
-               e.intro_hook.position if target == "hook" else e.outro_cta.position)
+        pos = (
+            e.subtitle.position if target == "subtitle" else
+            e.overlay.position if target == "logo" else
+            e.intro_hook.position if target == "hook" else
+            e.outro_cta.position)
         fx, fy = self._position_point(target, pos)
         self.lbl_live_preview.set_active(target)
         self.lbl_live_preview.set_marker(target, fx, fy)
+        if target == "subtitle":
+            subtitle = e.subtitle
+            self.lbl_live_preview.set_safe_margins(
+                subtitle.margin_left_percent, subtitle.margin_right_percent,
+                subtitle.margin_top_percent, subtitle.margin_bottom_percent)
+        elif target in ("hook", "cta"):
+            overlay = e.intro_hook if target == "hook" else e.outro_cta
+            margin = int(getattr(overlay, "safe_margin_percent", 5))
+            self.lbl_live_preview.set_safe_margins(margin, margin, margin, margin)
+        else:
+            self.lbl_live_preview.set_safe_margins(0, 0, 0, 0)
         labels = {"top-left": "Trên trái", "top-right": "Trên phải",
                   "bottom-left": "Dưới trái", "bottom-right": "Dưới phải",
-                  "top": "Trên", "middle": "Giữa", "bottom": "Dưới"}
-        self.lbl_preview_position.setText(f"{labels.get(pos, pos)} · đã lưu")
+                  "top": "Trên", "middle": "Giữa", "bottom": "Dưới",
+                  "blur_bottom": "Vùng mờ phía dưới"}
+        state = "chưa lưu" if self._settings_dirty else "đã lưu"
+        self.lbl_preview_position.setText(f"{labels.get(pos, pos)} · {state}")
+
+    def _sync_overlay_safe_frame(self, target: str) -> None:
+        if (not hasattr(self, "cmb_preview_target")
+                or self.cmb_preview_target.currentData() != target):
+            return
+        self._on_preview_target_changed()
+
+    def _refresh_overlay_warnings(self) -> None:
+        """Cảnh báo xung đột vùng hiển thị, không tự ý di chuyển nội dung."""
+        labels = getattr(self, "_overlay_warning_labels", {})
+        if not labels:
+            return
+        editor = self.cfg.editor
+        subtitle_pos = (
+            "bottom" if editor.subtitle.position == "blur_bottom"
+            else editor.subtitle.position)
+        logo_vertical = (
+            "top" if editor.overlay.position.startswith("top") else "bottom")
+        both_overlays = (
+            editor.intro_hook.enabled and editor.outro_cta.enabled
+            and editor.intro_hook.position == editor.outro_cta.position)
+        for key, overlay in (
+                ("hook", editor.intro_hook), ("cta", editor.outro_cta)):
+            conflicts = []
+            if overlay.enabled and editor.subtitle.enabled:
+                if overlay.position == subtitle_pos:
+                    conflicts.append("phụ đề")
+            if overlay.enabled and editor.overlay.enabled:
+                if overlay.position == logo_vertical:
+                    conflicts.append("logo")
+            if overlay.enabled and both_overlays:
+                other = editor.outro_cta if key == "hook" else editor.intro_hook
+                threshold = float(overlay.seconds) + float(other.seconds)
+                conflicts.append(
+                    f"{'CTA' if key == 'hook' else 'Hook'} ở video ngắn hơn "
+                    f"{threshold:g} giây")
+            label = labels.get(key)
+            if label is not None:
+                label.setText(
+                    "Có thể chồng với " + ", ".join(conflicts)
+                    + ". Hãy kiểm tra trên preview."
+                    if conflicts else "")
+                label.setVisible(bool(conflicts))
+
+    def _on_subtitle_safe_frame_changed(self) -> None:
+        """Đồng bộ khung lề phụ đề trên preview với cấu hình bản nháp."""
+        if not hasattr(self, "lbl_live_preview"):
+            return
+        subtitle = self.cfg.editor.subtitle
+        self.lbl_live_preview.set_safe_margins(
+            subtitle.margin_left_percent,
+            subtitle.margin_right_percent,
+            subtitle.margin_top_percent,
+            subtitle.margin_bottom_percent)
+        self._mark_preview_stale("subtitle")
 
     def _mark_preview_stale(self, target: str) -> None:
         """Báo rõ preview tĩnh cần render lại sau khi đổi cỡ chữ/logo."""
-        if hasattr(self, "cmb_preview_target") and target in ("logo", "hook", "cta"):
+        if hasattr(self, "cmb_preview_target") and target in (
+                "subtitle", "logo", "hook", "cta"):
             idx = self.cmb_preview_target.findData(target)
             if idx >= 0:
                 self.cmb_preview_target.setCurrentIndex(idx)
@@ -2715,7 +3228,7 @@ class MainWindow(QMainWindow):
             name = {"subtitle": "phụ đề", "hook": "Hook",
                     "cta": "CTA", "logo": "Logo"}.get(target, target)
             self.lbl_preview_position.setText(
-                f"Đã đổi cỡ {name} · bấm Cập nhật preview")
+                f"Đã đổi {name} · bấm Tạo / cập nhật xem trước")
 
     def _on_brand_combo_position(self, target: str, combo: QComboBox) -> None:
         """Đồng bộ dropdown Thương hiệu -> marker riêng trên preview."""
@@ -2728,15 +3241,17 @@ class MainWindow(QMainWindow):
             self._on_preview_target_changed()
 
     def on_pick_positions(self) -> None:
-        vids = self._downloaded_videos()
-        if not vids:
+        items = self._downloaded_preview_items()
+        if not items:
             QMessageBox.information(self, "Chưa có video", "Cần 1 video đã tải để xem trước vị trí.")
             return
         out_dir = Path(self.cfg.editor.output_dir) / "_previews"
         out_dir.mkdir(parents=True, exist_ok=True)
         png = str(out_dir / "pos_preview.png")
         try:
-            preview.preview_frame(self.cfg, vids[0], png, at_seconds=1.0)
+            preview.preview_frame(
+                self.cfg, items[0][1], png, at_seconds=1.0,
+                video_id=items[0][0])
         except Exception as e:
             QMessageBox.warning(self, "Lỗi tạo preview", str(e))
             return
@@ -2755,8 +3270,8 @@ class MainWindow(QMainWindow):
                 if combo is not None:
                     self._set_combo_data(combo, p[key])
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._save_cfg()
-        self._log_ed(f"Đã đặt vị trí trực quan: {p}")
+        self._mark_settings_dirty()
+        self._log_ed(f"Đã đặt vị trí trực quan vào bản nháp: {p}")
 
     def on_export_report(self) -> None:
         out = str(Path(self.cfg.editor.output_dir) / "bao_cao.md")
@@ -2767,14 +3282,68 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Lỗi báo cáo", str(e))
 
+    def _apply_download_mode(self) -> None:
+        """Áp dụng chế độ chỉ biên tập local mà không ảnh hưởng hàng đợi."""
+        enabled = bool(getattr(self.cfg.download, "enabled", True))
+        if hasattr(self, "download_content"):
+            self.download_content.setVisible(enabled)
+        if hasattr(self, "download_disabled"):
+            self.download_disabled.setVisible(not enabled)
+        if hasattr(self, "download_mode_bar"):
+            self.download_mode_bar.setVisible(enabled)
+        if hasattr(self, "lbl_download_mode"):
+            self.lbl_download_mode.setText(
+                "" if enabled else
+                "Chế độ xử lý video có sẵn · nhập video hoặc thư mục tại tab Hàng đợi")
+        if hasattr(self, "tabs") and hasattr(self, "_download_idx"):
+            self.tabs.setTabText(self._download_idx, "Tải xuống")
+
+    def _open_queue_import_video(self) -> None:
+        self.tabs.setCurrentIndex(self._queue_idx)
+        QTimer.singleShot(0, self._queue_tab.on_import)
+
+    def _open_queue_import_folder(self) -> None:
+        self.tabs.setCurrentIndex(self._queue_idx)
+        QTimer.singleShot(0, self._queue_tab.on_import_folder)
+
+    def _toggle_download_mode(self, on: bool) -> None:
+        """Tắt luồng YouTube nhưng vẫn giữ nguyên luồng biên tập video local."""
+        self.cfg.download.enabled = bool(on)
+        if not on:
+            self.cfg.download.auto_scan_enabled = False
+            self.chk_auto.blockSignals(True)
+            self.chk_auto.setChecked(False)
+            self.chk_auto.blockSignals(False)
+            if hasattr(self, "_auto"):
+                self._auto.stop_scheduler()
+            active = ((self._scan_worker and self._scan_worker.isRunning())
+                      or (self._manual_worker and self._manual_worker.isRunning()))
+            if active and hasattr(self, "_auto"):
+                self.on_stop_all_downloads()
+            self._log_dl(
+                "Đã tắt toàn bộ tính năng tải YouTube. "
+                "Hàng đợi vẫn nhận và xử lý video có sẵn.")
+        else:
+            self._log_dl(
+                "Đã bật tính năng tải YouTube. Quét tự động vẫn tắt cho đến khi được chọn.")
+        self._apply_download_mode()
+        self._save_cfg()
+
     def _toggle_auto(self, on: bool) -> None:
         """Bật/tắt tự động quét & tải định kỳ ở module cập nhật."""
+        if on and not self.cfg.download.enabled:
+            self.chk_auto.blockSignals(True)
+            self.chk_auto.setChecked(False)
+            self.chk_auto.blockSignals(False)
+            return
+        self.cfg.download.auto_scan_enabled = bool(on)
         if on:
             self._auto.start_scheduler()
             self._log_dl("Đã BẬT tự động quét & tải.")
         else:
             self._auto.stop_scheduler()
             self._log_dl("Đã TẮT tự động quét & tải (bấm 'Quét ngay' để chạy tay).")
+        self._save_cfg()
 
     def on_pick_input_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -2783,15 +3352,16 @@ class MainWindow(QMainWindow):
             return
         self.cfg.editor.input_folder = folder
         self.lbl_input.setText(folder)
-        self._watch_input_folder(folder)
-        if self.config_path:
-            try:
-                save_config(self.cfg, self.config_path)
-            except Exception as ex:
-                QMessageBox.warning(self, "Lỗi lưu config", str(ex))
+        self._mark_settings_dirty()
+        self._log_ed(
+            "Đã chọn thư mục theo dõi — bấm 'Lưu cài đặt' để bắt đầu theo dõi.")
 
     def _setup_input_folder_watch(self) -> None:
         """Theo dõi folder đầu vào và quét nhẹ định kỳ để bắt cả thư mục con."""
+        if hasattr(self, "_input_watcher"):
+            self._watch_input_folder(self._saved_editor.input_folder)
+            self._sync_input_folder()
+            return
         self._input_watcher = QFileSystemWatcher(self)
         self._input_watcher.directoryChanged.connect(lambda _p: self._input_debounce.start())
         self._input_debounce = QTimer(self)
@@ -2802,7 +3372,7 @@ class MainWindow(QMainWindow):
         self._input_poll.timeout.connect(self._sync_input_folder)
         self._input_file_state: dict[str, tuple[int, int]] = {}
         self._input_poll.start()
-        self._watch_input_folder(self.cfg.editor.input_folder)
+        self._watch_input_folder(self._saved_editor.input_folder)
         QTimer.singleShot(0, self._sync_input_folder)
 
     def _watch_input_folder(self, folder: str) -> None:
@@ -2815,7 +3385,7 @@ class MainWindow(QMainWindow):
             self._input_watcher.addPath(folder)
 
     def _sync_input_folder(self) -> None:
-        folder = self.cfg.editor.input_folder
+        folder = self._saved_editor.input_folder
         if not folder or not Path(folder).is_dir():
             return
         # Chỉ nhận file ổn định qua 2 lần kiểm tra để không edit khi file còn đang copy.
@@ -2838,12 +3408,12 @@ class MainWindow(QMainWindow):
             return
         self._queue_tab.refresh()
         self._log_ed(f"Tự động phát hiện {res['added']} video mới trong folder đầu vào.")
-        if self.cfg.editor.auto_edit_after_download:
+        if self._saved_editor.auto_edit_after_download:
             self._queue_tab.on_start()
 
     def on_edit_folder(self) -> None:
         """Import video từ folder đầu vào rồi đẩy video MỚI/CHƯA EDIT vào hàng đợi."""
-        folder = self.cfg.editor.input_folder
+        folder = self._saved_editor.input_folder
         if not folder or not Path(folder).is_dir():
             QMessageBox.information(self, "Chưa chọn folder",
                                     "Hãy bấm 'Chọn folder…' để chọn folder chứa video đầu vào.")
@@ -2883,14 +3453,15 @@ class MainWindow(QMainWindow):
         e.fill_missing = "none"  # chọn vùng thủ công -> crop-to-fill quanh vùng đó
         e.manual_focus_x = round(fx, 4)
         e.manual_focus_y = round(fy, 4)
-        if self.config_path:
-            try:
-                save_config(self.cfg, self.config_path)
-            except Exception as ex:
-                QMessageBox.warning(self, "Lỗi lưu config", str(ex))
+        if hasattr(self, "cmb_crop_mode"):
+            self._set_combo_data(self.cmb_crop_mode, "manual")
+        if hasattr(self, "cmb_fill"):
+            self._set_combo_data(self.cmb_fill, "none")
         self.lbl_edit_summary.setText(self._edit_summary())
-        self._log_ed(f"Đã đặt vùng crop thủ công: focus=({fx:.2f},{fy:.2f}); "
-                     f"crop_mode=manual, fill_missing=none.")
+        self._mark_settings_dirty()
+        self._log_ed(
+            f"Đã đặt vùng crop thủ công vào bản nháp: focus=({fx:.2f},{fy:.2f}); "
+            "bấm 'Lưu cài đặt' để áp dụng cho hàng đợi.")
 
     # ---------------- Bảng & log ----------------
     def _reload_table(self) -> None:
@@ -3040,7 +3611,70 @@ class MainWindow(QMainWindow):
         # Không hiển thị log trong màn hình cấu hình; thông tin kỹ thuật vẫn vào file log.
         log.info(msg)
 
+    def resizeEvent(self, event) -> None:
+        """Đổi bố cục theo không gian thật thay vì giả định một độ phân giải cố định."""
+        super().resizeEvent(event)
+        width = event.size().width()
+        height = event.size().height()
+        if hasattr(self, "edit_splitter"):
+            orientation = Qt.Vertical if width < 820 else Qt.Horizontal
+            if self.edit_splitter.orientation() != orientation:
+                self.edit_splitter.setOrientation(orientation)
+            if orientation == Qt.Vertical:
+                usable = max(430, height - 145)
+                self.edit_splitter.setSizes([
+                    max(230, int(usable * 0.58)),
+                    max(180, int(usable * 0.42)),
+                ])
+            else:
+                preview_width = min(460, max(280, int(width * 0.32)))
+                self.edit_splitter.setSizes([
+                    max(420, width - preview_width - 40), preview_width,
+                ])
+        if hasattr(self, "exports_hint"):
+            self.exports_hint.setVisible(width >= 850)
+        if hasattr(self, "exports_search"):
+            self.exports_search.setMaximumWidth(210 if width < 850 else 280)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Chờ Windows tính xong viền cửa sổ rồi loại phần taskbar khỏi kích thước tối đa.
+        QTimer.singleShot(0, self._constrain_to_work_area)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            QTimer.singleShot(0, self._constrain_to_work_area)
+
+    def _constrain_to_work_area(self) -> None:
+        """Không cho cửa sổ hoặc nội dung chui xuống dưới taskbar Windows."""
+        handle = self.windowHandle()
+        screen = handle.screen() if handle is not None else self.screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        border_w = max(0, frame.width() - self.width())
+        border_h = max(0, frame.height() - self.height())
+        max_w = max(480, available.width() - border_w)
+        max_h = max(420, available.height() - border_h)
+        self.setMaximumSize(max_w, max_h)
+        if self.width() > max_w or self.height() > max_h:
+            self.resize(min(self.width(), max_w), min(self.height(), max_h))
+
     def closeEvent(self, event) -> None:
+        if self._settings_dirty:
+            choice = QMessageBox.question(
+                self, "Cài đặt chưa được lưu",
+                "Bạn muốn lưu các thay đổi trong tab Cài đặt video trước khi thoát?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if choice == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if choice == QMessageBox.Save and not self.on_save_editor_settings():
+                event.ignore()
+                return
         # 1) Ngừng lịch quét nền + các bộ đếm giờ theo dõi folder.
         for stop in (lambda: self._auto.cancel_all_downloads(),
                      lambda: self._auto.stop_scheduler(),

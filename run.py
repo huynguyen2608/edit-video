@@ -67,6 +67,7 @@ def main() -> None:
 
     # SQLite là nguồn chính; lần chạy đầu tự nhập workbook cũ để không mất lịch sử.
     db = SQLiteStore(ROOT / "data.db", legacy_excel=ROOT / "data.xlsx")
+    db.backup_to(ROOT / "data.db.bak")
     db.reset_stuck()      # dọn trạng thái kẹt do lần chạy trước bị crash
     db.resume_queue()     # job đang chạy dở -> Interrupted để tiếp tục, giữ Completed
 

@@ -58,14 +58,29 @@ def transcribe_to_txt(video_or_audio: str, out_txt: str,
 def transcribe_segments(video_or_audio: str, model_size: str = "small",
                         device: str = "cuda", language: str | None = None):
     """Transcribe -> (list[Cue], ngôn_ngữ_nhận_diện). Dùng cho content + phụ đề."""
-    if device == "auto":
+    if device in ("auto", "cuda"):
         try:
-            return transcribe_segments(video_or_audio, model_size, "cuda", language)
+            return _transcribe_segments_on_device(
+                video_or_audio, model_size, "cuda", language)
         except Exception as exc:
             # Lỗi CUDA có thể chỉ xuất hiện khi duyệt generator segments, không chỉ
-            # lúc tạo model, nên fallback bao trọn toàn bộ lần nhận diện.
+            # lúc tạo model. Kể cả người dùng chọn CUDA, lỗi driver/runtime vẫn
+            # phải hạ về CPU thay vì làm hỏng toàn bộ video.
+            text = str(exc).lower()
+            is_cuda_error = any(token in text for token in (
+                "cuda", "cudnn", "cublas", "driver", "runtime",
+                "float16", "gpu"))
+            if device == "cuda" and not is_cuda_error:
+                raise
             log.warning("Whisper CUDA lỗi (%s); tự chuyển sang CPU int8.", exc)
-            return transcribe_segments(video_or_audio, model_size, "cpu", language)
+            return _transcribe_segments_on_device(
+                video_or_audio, model_size, "cpu", language)
+    return _transcribe_segments_on_device(
+        video_or_audio, model_size, device, language)
+
+
+def _transcribe_segments_on_device(video_or_audio: str, model_size: str,
+                                   device: str, language: str | None):
     from .subtitles import Cue
     compute_type = "float16" if device == "cuda" else "int8"
     model = _get_model(model_size, device, compute_type)

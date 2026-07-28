@@ -3,21 +3,24 @@ from __future__ import annotations
 
 import os
 import tempfile
+import html
+from copy import deepcopy
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QThread, QSize, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QSplitter,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
-from ..editor import export, smart_crop
+from ..editor import export, smart_crop, work_cache
 from ..editor.stages import Status, fmt_eta
 from ..queue_manager import QueueManager
 from ..paths import existing_output_video_path
+from ..preflight import runtime_check
 from ..workers.edit_worker import EditWorker
 from .theme import make_columns_resizable
 
@@ -84,12 +87,34 @@ class ThumbnailWorker(QThread):
             self.ready.emit(vid, png)
 
 
+class PreflightWorker(QThread):
+    """Kiểm tra môi trường ở nền để thao tác Bắt đầu không làm đứng giao diện."""
+    done = Signal(object)
+
+    def __init__(self, cfg, source_paths):
+        super().__init__()
+        self.cfg = cfg
+        self.source_paths = list(source_paths)
+
+    def run(self):
+        try:
+            report = runtime_check(self.cfg, self.source_paths)
+        except Exception as exc:
+            report = {
+                "blockers": [f"Không thể kiểm tra môi trường xử lý: {exc}"],
+                "warnings": [],
+                "info": [],
+            }
+        self.done.emit(report)
+
+
 class DashboardWidget(QFrame):
     """Thanh trạng thái gọn; badge lỗi/chờ có thể dùng như bộ lọc."""
     filter_requested = Signal(str)
 
     def __init__(self):
         super().__init__()
+        self._compact = False
         self.setObjectName("queueDashboard")
         self.setStyleSheet("#queueDashboard{background:#f8fafc;border:1px solid #e2e8f0;border-radius:7px;}")
         lay = QHBoxLayout(self)
@@ -118,15 +143,37 @@ class DashboardWidget(QFrame):
         self.summary = QLabel("0/0 video hoàn thành")
         self.summary.setAlignment(Qt.AlignRight)
         self.bar = QProgressBar()
-        self.bar.setFixedWidth(260)
+        self.bar.setMinimumWidth(160)
+        self.bar.setMaximumWidth(260)
+        self.bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.bar.setFormat("%p%")
         progress.addWidget(self.summary)
         progress.addWidget(self.bar)
         lay.addLayout(progress)
+        self._progress_panel = progress
+
+    def set_compact(self, compact: bool) -> None:
+        """Giảm nội dung phụ khi cửa sổ hẹp, không làm tràn thanh tổng quan."""
+        self._compact = compact
+        self.summary.setVisible(not compact)
+        self.bar.setVisible(not compact)
+        for key, (button, text) in self._badges.items():
+            short = {
+                "processing": "Xử lý", "waiting": "Chờ",
+                "completed": "Xong", "failed": "Lỗi",
+            }[key]
+            button.setText(
+                f"{button.property('count') or 0}  {short if compact else text}")
 
     def update_stats(self, d: dict) -> None:
         for key, (button, text) in self._badges.items():
-            button.setText(f"{d.get(key, 0)}  {text}")
+            button.setProperty("count", d.get(key, 0))
+            short = {
+                "processing": "Xử lý", "waiting": "Chờ",
+                "completed": "Xong", "failed": "Lỗi",
+            }[key]
+            button.setText(
+                f"{d.get(key, 0)}  {short if self._compact else text}")
         self.summary.setText(f"{d.get('completed', 0)}/{d.get('total', 0)} video hoàn thành")
         self.bar.setValue(int(d.get("overall", 0)))
 
@@ -227,7 +274,7 @@ class EditQueueWidget(QTableWidget):
             self.setItem(row, 1, title)
             self.setItem(row, 2, QTableWidgetItem())
             self._paint_status(row, job.status, job.error)
-            self._set_progress_cell(row, job.stage, job.progress)
+            self._set_progress_cell(row, job.stage, job.progress, job.status)
             self.setItem(row, 4, QTableWidgetItem("—"))
             self._set_action(row, job)
             if job.video_id == selected:
@@ -247,10 +294,13 @@ class EditQueueWidget(QTableWidget):
         box.addWidget(badge)
         self.setCellWidget(row, 2, host)
 
-    def _set_progress_cell(self, row, stage, pct):
+    def _set_progress_cell(self, row, stage, pct, status=None):
         cell = QWidget(); lay = QVBoxLayout(cell)
         lay.setContentsMargins(4, 4, 4, 4); lay.setSpacing(2)
-        label = QLabel(_STAGE_TEXT.get(stage, stage) if stage else "Chưa bắt đầu")
+        stage_text = _STAGE_TEXT.get(stage, stage) if stage else "Chưa bắt đầu"
+        if status == Status.FAILED and int(pct or 0) > 0:
+            stage_text = f"Dừng tại {int(pct)}% · {stage_text}"
+        label = QLabel(stage_text)
         label.setProperty("stageLabel", True)
         bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(int(pct or 0)); bar.setFixedHeight(16)
         lay.addWidget(label); lay.addWidget(bar)
@@ -326,19 +376,25 @@ class VideoInspectorWidget(QFrame):
         lay.addWidget(self.preview_heading)
         self.img = QLabel("Chọn một video để xem thông tin\nvà bản xem trước")
         self.img.setAlignment(Qt.AlignCenter)
-        self.img.setMinimumSize(260, 220)
-        self.img.setMaximumHeight(300)
-        self.img.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.img.setMinimumSize(240, 180)
+        self.img.setMaximumHeight(270)
+        self.img.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.img.setStyleSheet("background:#0f172a;color:#cbd5e1;border-radius:6px;")
-        lay.addWidget(self.img)
+        lay.addWidget(self.img, 3)
+
+        details_host = QWidget()
+        details = QVBoxLayout(details_host)
+        details.setContentsMargins(0, 2, 4, 2)
+        details.setSpacing(5)
         self.title = QLabel("Chưa chọn video"); self.title.setWordWrap(True)
         self.title.setStyleSheet("font-weight:600;")
-        lay.addWidget(self.title)
+        details.addWidget(self.title)
         self.status = QLabel("—"); self.status.setWordWrap(True)
-        lay.addWidget(self.status)
+        details.addWidget(self.status)
         self.progress = QProgressBar(); self.progress.setRange(0, 100)
-        lay.addWidget(self.progress)
+        details.addWidget(self.progress)
         grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
         self.meta = {}
         for row, (key, caption) in enumerate((("source", "Nguồn"), ("output", "Đầu ra"),
                                                ("resolution", "Độ phân giải"), ("duration", "Thời lượng"))):
@@ -346,21 +402,106 @@ class VideoInspectorWidget(QFrame):
             val = QLabel("—"); val.setTextInteractionFlags(Qt.TextSelectableByMouse)
             val.setToolTip(""); val.setWordWrap(False)
             grid.addWidget(val, row, 1); self.meta[key] = val
-        lay.addLayout(grid)
+        details.addLayout(grid)
         self.error = QLabel(); self.error.setWordWrap(True)
-        self.error.setStyleSheet("color:#b91c1c;background:#fef2f2;padding:6px;border-radius:4px;")
-        self.error.hide(); lay.addWidget(self.error)
-        actions = QHBoxLayout()
-        self.btn_preview = QPushButton("Xem bản chỉnh sửa")
-        self.btn_preview.setToolTip("Tạo một khung hình theo cấu hình edit hiện tại")
+        self.error.setTextFormat(Qt.RichText)
+        self.error.setStyleSheet(
+            "color:#991b1b;background:#fff7f7;border:1px solid #fecaca;"
+            "padding:8px;border-radius:6px;")
+        self.error.hide(); details.addWidget(self.error)
+        self.btn_error_detail = QPushButton("Xem nguyên nhân kỹ thuật")
+        self.btn_error_detail.clicked.connect(self._show_error_detail)
+        self.btn_error_detail.hide()
+        details.addWidget(self.btn_error_detail)
+        details.addStretch(1)
+
+        self.details_scroll = QScrollArea()
+        self.details_scroll.setWidgetResizable(True)
+        self.details_scroll.setFrameShape(QFrame.NoFrame)
+        self.details_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.details_scroll.setMinimumHeight(135)
+        self.details_scroll.setWidget(details_host)
+        lay.addWidget(self.details_scroll, 2)
+        actions = QGridLayout()
+        actions.setSpacing(6)
+        self.btn_preview = QPushButton("Xem theo cài đặt đã lưu")
+        self.btn_preview.setToolTip(
+            "Tạo một khung hình theo cấu hình đã lưu đang được Hàng đợi sử dụng")
         self.btn_preview.clicked.connect(self.make_preview)
         self.btn_play = QPushButton("Phát video"); self.btn_play.clicked.connect(self._play)
         self.btn_open = QPushButton("Mở thư mục"); self.btn_open.clicked.connect(self._open_dir)
         self.btn_retry = QPushButton("Thử lại"); self.btn_retry.clicked.connect(self._retry)
-        for button in (self.btn_preview, self.btn_play, self.btn_open, self.btn_retry): actions.addWidget(button)
+        actions.addWidget(self.btn_preview, 0, 0)
+        actions.addWidget(self.btn_play, 0, 1)
+        actions.addWidget(self.btn_open, 1, 0)
+        actions.addWidget(self.btn_retry, 1, 1)
         lay.addLayout(actions)
         self._technical_log = []
+        self._error_detail = ""
         self._sync_buttons()
+
+    @staticmethod
+    def _friendly_error(error: str) -> str:
+        text = str(error or "")
+        low = text.lower()
+        if "cuda driver version is insufficient" in low:
+            return "GPU CUDA không tương thích. Hãy dùng chế độ Tự động hoặc CPU."
+        if "no such file" in low or "không tìm thấy file" in low or "không thấy file" in low:
+            return "Không tìm thấy file video nguồn."
+        if "invalid argument" in low:
+            return "FFmpeg không chấp nhận một thiết lập âm thanh hoặc hình ảnh."
+        if "ffmpeg" in low:
+            return "Không thể xuất video bằng cấu hình hiện tại."
+        first = next((line.strip() for line in text.splitlines() if line.strip()), text)
+        return first[:220] + ("…" if len(first) > 220 else "")
+
+    def set_error(self, error: str) -> None:
+        self._error_detail = str(error or "")
+        friendly = html.escape(self._friendly_error(self._error_detail))
+        self.error.setText(
+            "<b>Không thể hoàn tất video</b><br>"
+            f"<span style='color:#b91c1c'>{friendly}</span>"
+            if self._error_detail else "")
+        self.error.setVisible(bool(self._error_detail))
+        self.btn_error_detail.setVisible(bool(self._error_detail))
+
+    def _show_error_detail(self):
+        if not self._error_detail:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Nguyên nhân kỹ thuật")
+        dialog.resize(640, 400)
+        root = QVBoxLayout(dialog)
+        heading = QLabel("Không thể hoàn tất video")
+        heading.setStyleSheet("font-size:16px;font-weight:600;color:#991b1b;")
+        root.addWidget(heading)
+        summary = QLabel(self._friendly_error(self._error_detail))
+        summary.setWordWrap(True)
+        summary.setStyleSheet(
+            "background:#fff7f7;border:1px solid #fecaca;"
+            "border-radius:6px;padding:9px;color:#991b1b;")
+        root.addWidget(summary)
+        note = QLabel(
+            "Chi tiết bên dưới dành cho việc kiểm tra lỗi. "
+            "Bạn có thể sao chép để lưu hoặc gửi hỗ trợ.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#64748b;")
+        root.addWidget(note)
+        detail = QPlainTextEdit(self._error_detail)
+        detail.setReadOnly(True)
+        detail.setLineWrapMode(QPlainTextEdit.NoWrap)
+        root.addWidget(detail, 1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        copy_button = QPushButton("Sao chép chi tiết")
+        copy_button.clicked.connect(
+            lambda: QApplication.clipboard().setText(self._error_detail))
+        actions.addWidget(copy_button)
+        close_button = QPushButton("Đóng")
+        close_button.clicked.connect(dialog.accept)
+        actions.addWidget(close_button)
+        root.addLayout(actions)
+        dialog.exec()
 
     def set_job(self, job) -> None:
         self._job = job
@@ -374,8 +515,7 @@ class VideoInspectorWidget(QFrame):
         for key, value in values.items():
             shown = value if len(value) < 54 else "…" + value[-51:]
             self.meta[key].setText(shown); self.meta[key].setToolTip(value)
-        self.error.setText("Lỗi: " + job.error if job.error else "")
-        self.error.setVisible(bool(job.error))
+        self.set_error(job.error)
         self._technical_log.clear()
         self._sync_buttons()
         if job.status == Status.COMPLETED:
@@ -389,7 +529,7 @@ class VideoInspectorWidget(QFrame):
         self.img.clear(); self.img.setText("Chọn một video để xem thông tin\nvà bản xem trước")
         self.title.setText("Chưa chọn video"); self.status.setText("—"); self.progress.setValue(0)
         for value in self.meta.values(): value.setText("—")
-        self.error.hide(); self._technical_log.clear(); self._sync_buttons()
+        self.set_error(""); self._technical_log.clear(); self._sync_buttons()
 
     def _sync_buttons(self):
         has = self._job is not None
@@ -451,7 +591,9 @@ class VideoInspectorWidget(QFrame):
             return
         try:
             png = os.path.join(tempfile.gettempdir(), f"vrs_preview_{job.video_id}.png")
-            export.preview_frame(self.cfg.editor, job.source_path, png, at_seconds=1.0)
+            export.preview_frame(
+                self.cfg.editor, job.source_path, png, at_seconds=1.0,
+                video_id=job.video_id)
             self.img.setPixmap(QPixmap(png).scaled(self.img.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
             self.preview_heading.setText("Xem trước · Theo cấu hình edit")
         except Exception as exc:
@@ -482,6 +624,8 @@ class QueueTab(QWidget):
         self.qm = QueueManager(cfg, db)
         self._worker = None
         self._thumb = None
+        self._preflight = None
+        self._preflight_preferred = None
         self._current = None
         self._starts = {}
         self._cache = tempfile.mkdtemp(prefix="vrs_thumb_")
@@ -511,52 +655,92 @@ class QueueTab(QWidget):
         self.queue.itemSelectionChanged.connect(self._selection_changed)
         self.preview = VideoInspectorWidget(cfg)
         self.preview.retry_requested.connect(self._retry_one)
-        split = QSplitter(Qt.Horizontal)
-        split.addWidget(self.queue); split.addWidget(self.preview)
-        split.setStretchFactor(0, 7); split.setStretchFactor(1, 3)
-        split.setSizes([900, 390])
-        root.addWidget(split, 1)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.queue); self.splitter.addWidget(self.preview)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        self.queue.setMinimumWidth(700)
+        self.preview.setMinimumWidth(320)
+        self.splitter.setStretchFactor(0, 67)
+        self.splitter.setStretchFactor(1, 33)
+        self.splitter.setSizes([870, 430])
+        root.addWidget(self.splitter, 1)
+        QTimer.singleShot(0, self._restore_splitter_widths)
         self.refresh()
 
+    def _restore_splitter_widths(self):
+        """Căn tỷ lệ ban đầu 67% danh sách / 33% xem trước."""
+        available = max(620, self.width() - 24)
+        inspector = max(320, int(available * 0.33))
+        self.splitter.setSizes([available - inspector, inspector])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = event.size().width()
+        compact = width < 920
+        self.dash.set_compact(compact)
+        self._arrange_controls(width >= 1050)
+        orientation = Qt.Vertical if width < 760 else Qt.Horizontal
+        if self.splitter.orientation() != orientation:
+            self.splitter.setOrientation(orientation)
+            if orientation == Qt.Vertical:
+                available = max(420, event.size().height() - 150)
+                self.splitter.setSizes([
+                    max(260, int(available * 0.58)),
+                    max(190, int(available * 0.42)),
+                ])
+            else:
+                QTimer.singleShot(0, self._restore_splitter_widths)
+
     def _build_controls(self):
-        row = QHBoxLayout(); row.setSpacing(6)
+        outer = QVBoxLayout()
+        outer.setSpacing(4)
+        self.controls_primary_host = QWidget()
+        self.controls_primary_row = QHBoxLayout(self.controls_primary_host)
+        self.controls_primary_row.setContentsMargins(0, 0, 0, 0)
+        self.controls_primary_row.setSpacing(6)
+        self.controls_secondary_host = QWidget()
+        self.controls_secondary_row = QHBoxLayout(self.controls_secondary_host)
+        self.controls_secondary_row.setContentsMargins(0, 0, 0, 0)
+        self.controls_secondary_row.setSpacing(6)
+
         self.search = QLineEdit(); self.search.setPlaceholderText("Tìm theo tên hoặc mã video…")
-        self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(220); self.search.setMaximumWidth(320)
-        self.search.textChanged.connect(self._apply_filter); row.addWidget(self.search)
+        self.search.setClearButtonEnabled(True)
+        self.search.setMinimumWidth(160)
+        self.search.setMaximumWidth(300)
+        self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.search.textChanged.connect(self._apply_filter)
         self.filter = QComboBox()
         for text, key in (("Tất cả trạng thái", "all"), ("Đang xử lý", "processing"),
                           ("Đang chờ", "waiting"), ("Hoàn thành", "completed"), ("Lỗi", "failed")):
             self.filter.addItem(text, key)
-        self.filter.currentIndexChanged.connect(self._apply_filter); row.addWidget(self.filter)
-        self.selected_label = QLabel(); self.selected_label.hide(); row.addWidget(self.selected_label)
-        row.addStretch(1)
+        self.filter.currentIndexChanged.connect(self._apply_filter)
+        self.selected_label = QLabel(); self.selected_label.hide()
         self.btn_remove_selected = QPushButton("Xóa đã chọn")
         self.btn_remove_selected.setToolTip(
             "Giữ Ctrl hoặc Shift để chọn nhiều dòng, sau đó xóa khỏi hàng đợi")
         self.btn_remove_selected.clicked.connect(self.on_remove_selected)
         self.btn_remove_selected.setEnabled(False)
         self.btn_remove_selected.hide()
-        row.addWidget(self.btn_remove_selected)
         self.btn_import = QPushButton("+ Nhập video")
         self.btn_import.setToolTip("Chọn một hoặc nhiều file video để thêm vào hàng đợi")
         self.btn_import.clicked.connect(self.on_import)
-        row.addWidget(self.btn_import)
         self.btn_import_folder = QPushButton("+ Nhập thư mục")
         self.btn_import_folder.setToolTip(
             "Thêm toàn bộ video trong một thư mục và các thư mục con vào hàng đợi")
         self.btn_import_folder.clicked.connect(self.on_import_folder)
-        row.addWidget(self.btn_import_folder)
         self.btn_rebuild = QPushButton("Cập nhật danh sách")
         self.btn_rebuild.setToolTip("Nạp lại các video đã tải vào hàng đợi")
         self.btn_rebuild.clicked.connect(self.on_rebuild_queue)
-        row.addWidget(self.btn_rebuild)
         self.btn_primary = QPushButton("Bắt đầu hàng đợi")
         self.btn_primary.setObjectName("primaryQueueButton")
-        self.btn_primary.clicked.connect(self._primary_action); row.addWidget(self.btn_primary)
+        self.btn_primary.clicked.connect(self._primary_action)
         self.btn_stop = QPushButton("Dừng"); self.btn_stop.clicked.connect(self.on_stop); self.btn_stop.hide()
-        row.addWidget(self.btn_stop)
-        more = QToolButton(); more.setText("Thao tác khác ⋯"); more.setPopupMode(QToolButton.InstantPopup)
-        menu = QMenu(more)
+        self.more_actions = QToolButton()
+        self.more_actions.setText("Thao tác khác ⋯")
+        self.more_actions.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self.more_actions)
         for text, fn in (("Thử lại tất cả video lỗi", self.on_retry),
                          ("Xóa video đã hoàn thành", self.on_remove_completed),
                          ("Mở thư mục video nguồn", self.on_open_source),
@@ -564,8 +748,44 @@ class QueueTab(QWidget):
             menu.addAction(QAction(text, menu, triggered=fn))
         menu.addSeparator()
         clear = QAction("Xóa toàn bộ hàng đợi", menu, triggered=self.on_clear); menu.addAction(clear)
-        more.setMenu(menu); row.addWidget(more)
-        return row
+        menu.insertAction(clear, QAction("Xóa cache xử lý", menu, triggered=self.on_clear_cache))
+        self.more_actions.setMenu(menu)
+
+        outer.addWidget(self.controls_primary_host)
+        outer.addWidget(self.controls_secondary_host)
+        self._arrange_controls(False)
+        return outer
+
+    @staticmethod
+    def _clear_control_row(layout: QHBoxLayout) -> None:
+        while layout.count():
+            layout.takeAt(0)
+
+    def _arrange_controls(self, wide: bool) -> None:
+        """Một hàng khi đủ rộng; chỉ xuống hàng khi các nút thật sự không còn chỗ."""
+        if not hasattr(self, "controls_primary_row"):
+            return
+        if getattr(self, "_controls_wide", None) == wide:
+            return
+        self._controls_wide = wide
+        self._clear_control_row(self.controls_primary_row)
+        self._clear_control_row(self.controls_secondary_row)
+
+        self.controls_primary_row.addWidget(self.search, 1)
+        self.controls_primary_row.addWidget(self.filter)
+        self.controls_primary_row.addWidget(self.selected_label)
+        self.controls_primary_row.addStretch(1)
+
+        actions = (
+            self.btn_remove_selected, self.btn_import, self.btn_import_folder,
+            self.btn_rebuild, self.btn_primary, self.btn_stop, self.more_actions,
+        )
+        target = self.controls_primary_row if wide else self.controls_secondary_row
+        if not wide:
+            target.addStretch(1)
+        for widget in actions:
+            target.addWidget(widget)
+        self.controls_secondary_host.setVisible(not wide)
 
     def refresh(self) -> None:
         jobs = self.qm.jobs()
@@ -635,6 +855,16 @@ class QueueTab(QWidget):
         job = next((j for j in self.qm.jobs() if j.video_id == vid), None)
         if job: self.preview.set_job(job)
 
+    def preview_source(self) -> tuple[str, str] | None:
+        """Return the active job, then the selected job, as preview input."""
+        jobs = self.qm.jobs()
+        job = next((item for item in jobs if item.status in Status.ACTIVE), None)
+        if job is None and self._current:
+            job = next((item for item in jobs if item.video_id == self._current), None)
+        if job and job.source_path and Path(job.source_path).is_file():
+            return job.video_id, job.source_path
+        return None
+
     def _on_row_action(self, vid, action):
         self._current = vid
         self.queue.select_video(vid)
@@ -661,6 +891,56 @@ class QueueTab(QWidget):
 
     def on_start(self, preferred_id=None):
         if self._worker and self._worker.isRunning(): return
+        if self._preflight and self._preflight.isRunning():
+            return
+        if not self.qm.next_pending(preferred_id):
+            self.refresh()
+            return
+        runnable = [job for job in self.qm.jobs() if job.status in Status.RUNNABLE]
+        missing = [job for job in runnable if not Path(job.source_path).is_file()]
+        for job in missing:
+            message = "Không tìm thấy file video nguồn. Hãy nhập lại file hoặc xóa khỏi hàng đợi."
+            self.db.set_edit_status(job.video_id, "failed", error=message)
+            self.db.update_job(
+                job.video_id, job_status=Status.FAILED, stage="", progress=0,
+                error=message)
+        if missing:
+            self.refresh()
+            self.data_changed.emit()
+        valid_paths = [
+            job.source_path for job in runnable if Path(job.source_path).is_file()
+        ]
+        if not valid_paths:
+            QMessageBox.warning(
+                self, "Không có video hợp lệ",
+                f"Đã đánh dấu {len(missing)} video bị mất file nguồn. "
+                "Các video khác trong hàng đợi không bị ảnh hưởng.")
+            return
+        self._preflight_preferred = preferred_id
+        self.btn_primary.setEnabled(False)
+        self.btn_primary.setText("Đang kiểm tra hệ thống…")
+        self.dash.state.setText("● Đang kiểm tra codec, RAM và ổ đĩa…")
+        self.dash.state.setStyleSheet("color:#2563eb;")
+        self._preflight = PreflightWorker(deepcopy(self.cfg), valid_paths)
+        self._preflight.done.connect(self._on_preflight_done)
+        self._preflight.start()
+
+    def _on_preflight_done(self, report):
+        self.btn_primary.setEnabled(True)
+        self.btn_primary.setText("Bắt đầu hàng đợi")
+        details = "\n".join(
+            [*(f"• {line}" for line in report["info"]),
+             *(f"⚠ {line}" for line in report["warnings"])])
+        self.dash.state.setToolTip(details)
+        if report["blockers"]:
+            self.dash.set_running(False)
+            QMessageBox.critical(
+                self, "Chưa thể bắt đầu hàng đợi",
+                "\n\n".join(report["blockers"])
+                + ("\n\nThông tin kiểm tra:\n" + details if details else ""))
+            return
+        preferred_id = self._preflight_preferred
+        self._preflight_preferred = None
         if not self.qm.next_pending(preferred_id):
             self.refresh()
             return
@@ -783,6 +1063,24 @@ class QueueTab(QWidget):
             self.qm.remove_from_queue([j.video_id for j in jobs])
             self._current = None; self.preview.clear_job(); self.refresh()
 
+    def on_clear_cache(self):
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(
+                self, "Hàng đợi đang chạy",
+                "Hãy dừng xử lý trước khi xóa cache trung gian.")
+            return
+        if QMessageBox.question(
+                self, "Xóa cache xử lý",
+                "Xóa transcript, file tách âm, TTS và dữ liệu crop đã lưu tạm?\n\n"
+                "Video nguồn, video đã xuất, phụ đề tải về và hàng đợi không bị xóa.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        count, total_bytes = work_cache.clear_all(self.cfg.editor.output_dir)
+        QMessageBox.information(
+            self, "Đã xóa cache",
+            f"Đã xóa {count} file cache ({total_bytes / (1024 * 1024):.1f} MB).")
+
     def on_rebuild_queue(self):
         count = self.qm.rebuild_queue()
         self.refresh()
@@ -827,12 +1125,12 @@ class QueueTab(QWidget):
         self.dash.update_stats(self.qm.dashboard())
         self.data_changed.emit()
         if vid == self._current:
-            self.preview.error.setText("Lỗi: " + err); self.preview.error.show()
+            self.preview.set_error(err)
             self.preview.append_log(f"[LỖI] {err}")
 
     def _on_cancelled(self, vid):
         if vid == self._current:
-            self.preview.error.hide()
+            self.preview.set_error("")
         self.refresh()
         self.data_changed.emit()
 
@@ -856,6 +1154,9 @@ class QueueTab(QWidget):
                 t.terminate(); t.wait(1000)
 
     def shutdown(self):
+        preflight = self._preflight
+        if preflight and preflight.isRunning():
+            preflight.wait(17000)
         w = self._worker
         if w and w.isRunning():
             w.request_stop()

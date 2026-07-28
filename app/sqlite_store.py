@@ -91,3 +91,12 @@ class SQLiteStore(ExcelStore):
         wb.save(path)
         wb.close()
         return str(path)
+
+    def backup_to(self, path: str | Path) -> str:
+        """Tạo snapshot SQLite nhất quán, kể cả khi database đang dùng WAL."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path, timeout=15) as source:
+            with sqlite3.connect(str(target), timeout=15) as destination:
+                source.backup(destination)
+        return str(target)

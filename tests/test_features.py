@@ -30,8 +30,10 @@ def test_ducking_uses_sidechaincompress():
 # ---- #6 preset ----
 def test_platform_preset():
     c = AppConfig()
+    c.editor.subtitle.font_size = 17
     assert presets.apply_platform_preset(c, "tiktok") is True
     assert c.editor.target_aspect == "9:16" and c.editor.export.short_seconds == 60
+    assert c.editor.subtitle.font_size == 17
     assert presets.apply_platform_preset(c, "youtube") is True
     assert c.editor.target_aspect == "16:9"
     assert presets.apply_platform_preset(c, "khong-co") is False
@@ -43,6 +45,7 @@ def test_fingerprint_deterministic_and_bounded():
     assert d1 == fingerprint.deltas_for("vid1")          # xác định
     assert fingerprint.deltas_for("vid2") != d1          # khác video -> khác
     assert 0.98 - 0.01 <= d1["speed_mul"] <= 1.02 + 0.01
+    assert -1.0 <= d1["fps_unit"] <= 1.0
 
 
 def test_fingerprint_apply_does_not_mutate_original():
@@ -51,6 +54,7 @@ def test_fingerprint_apply_does_not_mutate_original():
     assert e2 is not e and e.speed == 1.0                # gốc không đổi
     assert e2.color_grading.enabled is True
     assert 0.9 < e2.speed < 1.1
+    assert 0.999 <= e2._fingerprint_fps_multiplier <= 1.001
 
 
 # ---- #10 report ----

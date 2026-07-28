@@ -1,8 +1,37 @@
 """Test dựng filter_complex audio: ưu tiên nguồn, trộn nhạc, đồng bộ tempo, mute."""
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
 from app.config import EditorCfg
 from app.editor import audio_ops as ao
 from app.editor import export
 from app.editor.export import RenderInputs
+
+
+def test_timed_voiceover_delays_each_cue_and_fits_long_audio():
+    captured = {}
+
+    def fake_run(cmd, **_kwargs):
+        captured["cmd"] = cmd
+        class Result:
+            returncode = 0
+            stderr = ""
+        return Result()
+
+    durations = {"one.mp3": 1.0, "two.mp3": 4.0}
+    with tempfile.TemporaryDirectory() as tmp, \
+            patch.object(ao, "audio_duration", side_effect=lambda path: durations[path]), \
+            patch.object(ao, "run_cancellable", side_effect=fake_run):
+        out = str(Path(tmp) / "timed.wav")
+        assert ao.compose_timed_voiceover([
+            ("one.mp3", 1.0, 3.0),
+            ("two.mp3", 5.0, 7.0),
+        ], out) == out
+    graph = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+    assert "adelay=1000:all=1" in graph
+    assert "adelay=5000:all=1" in graph
+    assert "atempo=2.0" in graph
 
 
 def test_mute_all_produces_no_audio_stream():
@@ -51,14 +80,16 @@ def test_edge_voiceover_excludes_isolated_and_original_speech():
     assert "[0:a]aresample" not in joined
 
 
-def test_voiceover_ignores_audio_speed_to_stay_synced():
+def test_voiceover_uses_new_audio_speed():
     """Có lồng tiếng -> tempo CHỈ theo cfg.speed (bỏ audio_speed) để không lệch lời."""
     e = EditorCfg(); e.speed = 1.0; e.audio.audio_speed = 2.0; e.audio.pitch_shift_semitones = 0
     g_vo = ao.build_audio_filtergraph(e, original="0:a", voiceover="1:a")
-    assert "atempo" not in g_vo                      # tempo = 1.0 -> không đổi nhịp
+    assert "atempo=2.0" in g_vo
     # Không lồng tiếng nhưng có nhạc -> tempo = speed*audio_speed = 2.0
     g_music = ao.build_audio_filtergraph(e, original="0:a", music="1:a")
-    assert "atempo=2.0" in g_music
+    assert "atempo=2.0" not in g_music
+    g_music_only = ao.build_audio_filtergraph(e, original=None, music="1:a")
+    assert "atempo=2.0" in g_music_only
 
 
 def test_edge_voiceover_can_mix_only_with_background_music():
@@ -193,12 +224,20 @@ def test_tempo_follows_editor_speed():
     assert "atempo=2.0" in g
 
 
-def test_audio_speed_stacks_on_editor_speed():
+def test_audio_speed_is_ignored_for_original_dialogue():
     e = EditorCfg()
     e.speed = 2.0
     e.audio.audio_speed = 2.0  # 2 * 2 = 4 -> hai atempo=2.0
     g = ao.build_audio_filtergraph(e, original="0:a")
-    assert g.count("atempo=2.0") == 2
+    assert g.count("atempo=2.0") == 1
+
+
+def test_audio_speed_applies_to_replacement_voiceover():
+    e = EditorCfg()
+    e.speed = 0.5
+    e.audio.audio_speed = 1.5
+    g = ao.build_audio_filtergraph(e, original="0:a", voiceover="1:a")
+    assert "atempo=0.75" in g
 
 
 def test_no_op_audio_is_anull_with_apad():

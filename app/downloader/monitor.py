@@ -48,6 +48,23 @@ def in_date_range(published: str, since: str = "", until: str = "") -> bool:
     return not ((since and day < since) or (until and day > until))
 
 
+def published_date(info: dict) -> str:
+    """Lấy ngày đăng từ metadata yt-dlp đầy đủ hoặc rút gọn."""
+    for key in ("upload_date", "release_date", "modified_date"):
+        value = str(info.get(key) or "")
+        if len(value) == 8 and value.isdigit():
+            return f"{value[:4]}-{value[4:6]}-{value[6:]}"
+    for key in ("timestamp", "release_timestamp"):
+        value = info.get(key)
+        if value is not None:
+            try:
+                return datetime.fromtimestamp(
+                    float(value), tz=timezone.utc).date().isoformat()
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return ""
+
+
 def resolve_channel_id(url_or_id: str, timeout: int = 15) -> str:
     """Chuyển url kênh / handle (@abc) / channel_id thành channel_id (UC...).
 
@@ -117,20 +134,49 @@ def fetch_history(channel_ref: str, channel_id: str = "", limit: int = 500) -> l
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(ref, download=False) or {}
+    entries = [entry for entry in (info.get("entries") or []) if entry]
+
+    # Flat playlist thường thiếu upload_date. RSS chứa ngày chính xác của khoảng
+    # 15 video mới nhất nên dùng nó trước, không phát sinh nhiều request.
+    rss_dates: dict[str, str] = {}
+    if channel_id:
+        try:
+            rss_dates = {item.video_id: item.published for item in fetch_recent(channel_id)}
+        except Exception as exc:
+            log.warning("Không ghép được ngày từ RSS cho %s: %s", channel_id, exc)
+
+    # Chỉ probe từng video vẫn thiếu ngày (thường là video cũ hơn phạm vi RSS).
+    details: dict[str, dict] = {}
+    missing = []
+    for entry in entries:
+        vid = entry.get("id") or extract_video_id(entry.get("url", ""))
+        if vid and not (published_date(entry) or rss_dates.get(vid)):
+            missing.append(vid)
+    if missing:
+        detail_opts = {
+            "skip_download": True, "quiet": True, "no_warnings": True,
+            "ignoreerrors": True, "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(detail_opts) as detail_ydl:
+            for vid in missing:
+                try:
+                    details[vid] = detail_ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={vid}", download=False) or {}
+                except Exception as exc:
+                    log.warning("Không lấy được ngày chi tiết của %s: %s", vid, exc)
+
     out = []
-    for entry in info.get("entries") or []:
+    for entry in entries:
         if not entry:
             continue
         vid = entry.get("id") or extract_video_id(entry.get("url", ""))
         if not vid:
             continue
-        published = ""
-        upload_date = str(entry.get("upload_date") or "")
-        if len(upload_date) == 8 and upload_date.isdigit():
-            published = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
-        elif entry.get("timestamp"):
-            published = datetime.fromtimestamp(
-                float(entry["timestamp"]), tz=timezone.utc).date().isoformat()
+        published = (
+            published_date(entry)
+            or rss_dates.get(vid, "")
+            or published_date(details.get(vid, {}))
+        )
         out.append(DiscoveredVideo(
             video_id=vid, title=entry.get("title") or vid,
             url=entry.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}",

@@ -1,10 +1,12 @@
 """Test path an toàn Windows, bóc video id, filter audio."""
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 from app.paths import safe_name, video_dir, output_video_path, existing_output_video_path
-from app.downloader.monitor import _extract_vid, extract_video_id, in_date_range
+from app.downloader.monitor import _extract_vid, extract_video_id, in_date_range, published_date
 from app.editor.audio_ops import pitch_speed_filters
 from app.editor.cancel import EditCancelled, run_cancellable
 from app.downloader.downloader import quality_format, _looks_like_cookie_error
@@ -12,6 +14,17 @@ from app.editor import transcribe
 from app.config import AppConfig
 from app.editor.pipeline import EditPipeline
 from app.store import ExcelStore
+from app import preflight
+
+
+def test_runtime_preflight_blocks_missing_source_without_testing_cpu_encoder():
+    cfg = AppConfig()
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg.editor.output_dir = tmp
+        missing = str(Path(tmp) / "missing.mp4")
+        report = preflight.runtime_check(cfg, [missing])
+    assert any("Không tìm thấy" in item for item in report["blockers"])
+    assert preflight._encoder_trial("libx264") == ""
 
 
 def test_cookie_error_dpapi_detected():
@@ -157,6 +170,13 @@ def test_video_date_range_is_inclusive_and_custom():
     assert in_date_range("", "", "")
 
 
+def test_published_date_supports_flat_and_detailed_metadata():
+    assert published_date({"upload_date": "20260726"}) == "2026-07-26"
+    assert published_date({"release_date": "20260725"}) == "2026-07-25"
+    assert published_date({"timestamp": 0}) == "1970-01-01"
+    assert published_date({"upload_date": "unknown"}) == ""
+
+
 def test_download_quality_falls_back_without_exceeding_selected_height():
     fmt = quality_format(1080)
     assert "height<=1080" in fmt
@@ -188,6 +208,29 @@ def test_whisper_auto_falls_back_to_cpu_when_cuda_fails():
         transcribe._get_model = original
     assert calls == ["cuda", "cpu"]
     assert lang == "en" and cues[0].text == "ok"
+
+
+def test_whisper_explicit_cuda_also_falls_back_on_driver_error():
+    original = transcribe._get_model
+    calls = []
+
+    class FakeModel:
+        def __init__(self, device): self.device = device
+        def transcribe(self, *_args, **_kwargs):
+            calls.append(self.device)
+            if self.device == "cuda":
+                raise RuntimeError(
+                    "CUDA driver version is insufficient for CUDA runtime version")
+            seg = type("Seg", (), {"start": 0.0, "end": 1.0, "text": "ok"})()
+            return iter([seg]), type("Info", (), {"language": "vi"})()
+
+    transcribe._get_model = lambda _size, device, _compute: FakeModel(device)
+    try:
+        cues, lang = transcribe.transcribe_segments("input.mp4", device="cuda")
+    finally:
+        transcribe._get_model = original
+    assert calls == ["cuda", "cpu"]
+    assert lang == "vi" and cues[0].text == "ok"
 
 
 def test_safe_name_strips_forbidden():

@@ -30,6 +30,7 @@ from typing import Optional
 from openpyxl import Workbook, load_workbook
 
 from .logging_setup import get_logger
+from .job_state import job_status_for_edit, normalize_persisted_row
 
 log = get_logger("store")
 
@@ -224,6 +225,10 @@ class ExcelStore:
             if path is not None:            # COALESCE: chỉ ghi đè khi có giá trị mới
                 row["download_path"] = path
             row["error"] = error
+            if status == "downloaded":
+                row["job_status"] = job_status_for_edit(
+                    status, row.get("edit_status") or "pending",
+                    row.get("job_status") or "")
             self._save()
 
     def transition_download_status(self, video_id: str, expected, status: str) -> bool:
@@ -243,8 +248,13 @@ class ExcelStore:
             if not row:
                 return
             row["edit_status"] = status
+            row["job_status"] = job_status_for_edit(
+                row.get("download_status") or "", status,
+                row.get("job_status") or "")
             if status == "done":
                 row["edited_at"] = _now()
+                row["stage"] = "Completed"
+                row["progress"] = 100
             row["error"] = error
             self._save()
 
@@ -256,6 +266,9 @@ class ExcelStore:
                     row.get("edit_status") != "pending"):
                 return False
             row["edit_status"] = "processing"
+            row["job_status"] = job_status_for_edit(
+                row.get("download_status") or "", "processing",
+                row.get("job_status") or "")
             row["error"] = None
             self._save()
             return True
@@ -399,10 +412,7 @@ class ExcelStore:
         with self._lock:
             changed = False
             for r in self._videos.values():
-                if r.get("download_status") == "downloading":
-                    r["download_status"] = "paused"; changed = True
-                if r.get("edit_status") == "processing":
-                    r["edit_status"] = "pending"; changed = True
+                changed = normalize_persisted_row(r, interrupted=True) or changed
             if changed:
                 self._save()
 
@@ -456,12 +466,11 @@ class ExcelStore:
         để tiếp tục; Completed giữ nguyên (không chạy lại). Đồng thời reset edit_status
         'processing' -> 'pending'."""
         with self._lock:
+            changed = False
             for r in self._videos.values():
-                if r.get("job_status") in ("Preparing", "Processing", "Rendering"):
-                    r["job_status"] = "Interrupted"
-                if r.get("edit_status") == "processing":
-                    r["edit_status"] = "pending"
-            self._save()
+                changed = normalize_persisted_row(r, interrupted=True) or changed
+            if changed:
+                self._save()
 
 
 def _read_sheet(ws, cols: list[str], key: str) -> dict[str, dict]:  # noqa: E302

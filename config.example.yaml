@@ -1,7 +1,12 @@
 # ================= Video Repurpose Studio - cấu hình =================
 # Copy file này thành config.yaml rồi chỉnh. config.yaml không nên commit.
 
+schema_version: 1
 download:
+  # Disable this to use local videos only.
+  enabled: true
+  # Periodic scanning is opt-in.
+  auto_scan_enabled: false
   # Thư mục gốc lưu video tải về (ổ D theo yêu cầu). App tự tạo cây con: <root>/<channel>/<video_id>/
   root_dir: "D:/VideoRepurpose/downloads"
   # Các kênh CỦA BẠN cần theo dõi. Lấy channel_id (bắt đầu bằng UC...) từ trang kênh.
@@ -50,8 +55,9 @@ editor:
   # none          = crop-to-fill: cắt quanh vùng action chính cho lấp đầy khung.
   fill_missing: "blur" # blur | pad_black | none
   zoom_fill_percent: 0 # mặc định không zoom để giữ gần nguồn
-  fingerprint_enabled: false # biến đổi NHẸ mỗi video (speed/màu/zoom) để chống trùng nội dung
+  fingerprint_enabled: true # biến đổi kỹ thuật NHẸ mỗi video; không bảo đảm tránh bản quyền
   fingerprint_strength: 1.0 # 0..2
+  fingerprint_fps_percent: 0.1 # FPS ±0.1%; không nội suy khung hình
   # Chế độ blur (vd 16:9 -> 9:16): cắt bớt HAI BÊN video chính trước khi scale để
   # nội dung hiển thị to hơn. % chiều rộng mỗi bên, chỉnh 0..10.
   side_crop_percent: 2 # thay đổi nhẹ, vẫn giữ phần lớn khung hình
@@ -90,6 +96,8 @@ editor:
     seconds: 3
     position: "top" # top | middle | bottom
     font_size: 16
+    style_preset: "soft_box"
+    safe_margin_percent: 5
     box: true # nền hộp bán trong suốt cho dễ đọc
     fade_ms: 300 # mờ dần vào/ra
     auto: false # tự gợi ý hook từ transcript nếu text trống
@@ -99,6 +107,8 @@ editor:
     seconds: 10
     position: "bottom"
     font_size: 16
+    style_preset: "soft_box"
+    safe_margin_percent: 5
     box: true
     fade_ms: 300
   picture_in_picture:
@@ -131,6 +141,13 @@ editor:
     burn_in: true # in phụ đề (chỉ ngôn ngữ đã chọn) lên video
     position: "bottom" # top | middle | bottom
     font_size: 14
+    font_color: "#FFFFFF"
+    background_color: "#000000"
+    background_opacity: 0.55
+    margin_left_percent: 0
+    margin_right_percent: 0
+    margin_top_percent: 0
+    margin_bottom_percent: 0
     merge_gap_ms: 300 # gộp cue cách nhau < ngưỡng (đoạn ngắn gần nhau -> dịch không sai lời)
     min_cue_ms: 1200 # cue ngắn hơn -> gộp với lân cận
     max_cue_ms: 7000 # trần độ dài 1 cue sau khi gộp
@@ -149,6 +166,7 @@ editor:
     encoder_preset: "medium"       # cân bằng tốc độ/chất lượng; chọn fast nếu CPU yếu
     output_short_edge: 0 # 0=tự chọn theo nguồn; hoặc 720/1080/1440/2160
     audio_bitrate_kbps: 256
+    render_stall_timeout_seconds: 300 # dừng và báo lỗi nếu FFmpeg im lặng 5 phút
     copy_audio_when_unchanged: true
 
 logging:

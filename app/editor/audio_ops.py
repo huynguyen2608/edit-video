@@ -44,6 +44,79 @@ def extract_audio(video_path: str, out_wav: str, ffmpeg: str = "ffmpeg", cancel_
     return out_wav
 
 
+def audio_duration(path: str, ffprobe: str = "ffprobe") -> float:
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=20)
+        return max(0.0, float((result.stdout or "0").strip() or 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def compose_timed_voiceover(items, output_path: str, cancel_cb=None,
+                            ffmpeg: str = "ffmpeg") -> str:
+    """Ghép các file TTS vào đúng timestamp cue và co nhẹ câu dài cho vừa ô thời gian."""
+    entries = [(str(path), float(start), float(end))
+               for path, start, end in items if path and float(end) > float(start)]
+    if not entries:
+        raise RuntimeError("Không có cue lồng tiếng hợp lệ.")
+    # Windows giới hạn độ dài command line. Ghép theo lô để video nhiều cue
+    # không tạo một lệnh FFmpeg quá dài hoặc mở hàng trăm input cùng lúc.
+    if len(entries) > 40:
+        target = Path(output_path)
+        batches = []
+        try:
+            for index in range(0, len(entries), 40):
+                part = target.with_name(
+                    f"{target.stem}.tts_batch_{index // 40:03d}.wav")
+                chunk = entries[index:index + 40]
+                compose_timed_voiceover(
+                    chunk, str(part), cancel_cb=cancel_cb, ffmpeg=ffmpeg)
+                batches.append((str(part), 0.0, max(item[2] for item in chunk)))
+            return compose_timed_voiceover(
+                batches, output_path, cancel_cb=cancel_cb, ffmpeg=ffmpeg)
+        finally:
+            for path, _start, _end in batches:
+                Path(path).unlink(missing_ok=True)
+    cmd = [ffmpeg, "-y"]
+    for path, _start, _end in entries:
+        cmd += ["-i", path]
+    filters = []
+    labels = []
+    for index, (path, start, end) in enumerate(entries):
+        slot = max(0.25, end - start)
+        duration = audio_duration(path)
+        chain = [f"aresample={_SR}"]
+        if duration > slot * 1.02:
+            chain.extend(_atempo_chain(duration / slot))
+        delay = max(0, int(round(start * 1000)))
+        chain.append(f"adelay={delay}:all=1")
+        label = f"tts{index}"
+        filters.append(f"[{index}:a]{','.join(chain)}[{label}]")
+        labels.append(f"[{label}]")
+    filters.append(
+        f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:"
+        "normalize=0,alimiter=limit=0.95[ttsout]")
+    cmd += [
+        "-filter_complex", ";".join(filters), "-map", "[ttsout]",
+        "-ac", "2", "-ar", str(_SR), output_path,
+    ]
+    try:
+        run_cancellable(
+            cmd, cancel_cb=cancel_cb, check=True, capture_output=True, text=True)
+    except EditCancelled:
+        Path(output_path).unlink(missing_ok=True)
+        raise
+    except subprocess.CalledProcessError as exc:
+        Path(output_path).unlink(missing_ok=True)
+        raise RuntimeError(
+            "Không thể đồng bộ lồng tiếng theo phụ đề: "
+            + ((exc.stderr or "")[-600:]))
+    return output_path
+
+
 # Model mặc định theo backend. MDX (ONNX) nhẹ, chạy CPU tốt (khuyên cho máy yếu);
 # VR Architecture cần torch; Demucs chất lượng cao nhất nhưng nặng.
 _DEFAULT_MODELS = {"mdx": "UVR-MDX-NET-Voc_FT.onnx", "vr": "1_HP-UVR.pth"}
@@ -267,7 +340,10 @@ def build_audio_filtergraph(cfg, *, original: str = "0:a",
     # Lồng tiếng (TTS/file thu sẵn) PHẢI khớp đúng tốc độ VIDEO để không lệch lời, nên
     # chỉ áp cfg.speed (bỏ qua audio_speed vốn dùng để đổi vân tay). Không có lồng tiếng
     # mới áp thêm audio_speed cho phần audio gốc/nhạc.
-    aspeed = 1.0 if voiceover else max(1e-6, float(a.audio_speed))
+    replacement_audio = bool(
+        voiceover or (music and not original and not vocals))
+    aspeed = (
+        max(1e-6, float(a.audio_speed)) if replacement_audio else 1.0)
     tempo_factor = max(1e-6, float(cfg.speed)) * aspeed
     # apad ở cuối: nếu audio (voiceover/nhạc) NGẮN hơn video thì đệm im lặng cho đủ,
     # tránh -shortest cắt cụt phần hình còn lại.
@@ -279,10 +355,14 @@ def build_audio_filtergraph(cfg, *, original: str = "0:a",
 
 
 def needs_audio_filtergraph(cfg, *, has_voiceover: bool, has_vocals: bool,
-                            has_music: bool) -> bool:
+                            has_music: bool, has_original: bool = True) -> bool:
     """True nếu phải dựng filter_complex audio (thay vì map thẳng audio gốc)."""
     a = cfg.audio
-    tempo_factor = max(1e-6, float(cfg.speed)) * max(1e-6, float(a.audio_speed))
+    replacement_audio = bool(
+        has_voiceover or (has_music and not has_vocals and not has_original))
+    aspeed = (
+        max(1e-6, float(a.audio_speed)) if replacement_audio else 1.0)
+    tempo_factor = max(1e-6, float(cfg.speed)) * aspeed
     return bool(has_voiceover or has_vocals or has_music
                 or getattr(a, "enhance_original_voice", False)
                 or a.pitch_shift_semitones

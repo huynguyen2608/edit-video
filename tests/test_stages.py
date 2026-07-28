@@ -1,5 +1,42 @@
 """Test ProgressTracker: % tổng theo công đoạn + ETA thật, bỏ công đoạn tắt."""
 from app.editor.stages import ProgressTracker, Stage, Status, active_stages, fmt_eta
+from app.job_state import canonical_job_status, job_status_for_edit, normalize_persisted_row
+
+
+def test_canonical_job_status_has_one_precedence():
+    assert canonical_job_status({
+        "download_status": "downloaded", "edit_status": "done",
+        "job_status": Status.RENDERING,
+    }) == Status.COMPLETED
+    assert canonical_job_status({
+        "download_status": "downloaded", "edit_status": "failed",
+        "job_status": Status.PROCESSING,
+    }) == Status.FAILED
+    assert canonical_job_status({
+        "download_status": "downloaded", "edit_status": "pending",
+        "job_status": Status.PAUSED,
+    }) == Status.PAUSED
+
+
+def test_edit_state_synchronizes_job_state_without_losing_user_control():
+    assert job_status_for_edit("downloaded", "processing", "") == Status.PREPARING
+    assert job_status_for_edit("downloaded", "done", Status.RENDERING) == Status.COMPLETED
+    assert job_status_for_edit("downloaded", "failed", Status.PROCESSING) == Status.FAILED
+    assert job_status_for_edit("downloaded", "pending", Status.PAUSED) == Status.PAUSED
+
+
+def test_normalize_persisted_row_recovers_interrupted_and_repairs_done():
+    active = {"download_status": "downloaded", "edit_status": "processing",
+              "job_status": Status.RENDERING, "stage": Stage.RENDERING, "progress": 80}
+    assert normalize_persisted_row(active, interrupted=True)
+    assert active["edit_status"] == "pending"
+    assert active["job_status"] == Status.INTERRUPTED
+
+    done = {"download_status": "downloaded", "edit_status": "done",
+            "job_status": Status.PROCESSING, "stage": "", "progress": 12}
+    assert normalize_persisted_row(done)
+    assert done["job_status"] == Status.COMPLETED
+    assert done["stage"] == Stage.COMPLETED and done["progress"] == 100
 
 
 def test_active_stages_skips_disabled():

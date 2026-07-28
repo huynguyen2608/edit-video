@@ -39,6 +39,16 @@ def test_sqlite_export_excel(tmp_path):
     assert out.exists()
 
 
+def test_sqlite_consistent_backup(tmp_path):
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    db = SQLiteStore(source)
+    db.add_discovered("v1", "c", "Channel", "Title", "url", "2026-01-01")
+    assert db.backup_to(backup) == str(backup)
+    restored = SQLiteStore(backup)
+    assert restored.video_exists("v1")
+
+
 def test_migrates_legacy_excel_with_history(tmp_path):
     excel = tmp_path / "data.xlsx"
     old = ExcelStore(excel)

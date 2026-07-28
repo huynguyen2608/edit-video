@@ -2,9 +2,15 @@ __pycache__/
 *.pyc
 .venv/
 config.yaml
+config.yaml.bak
+*.bak
 data.xlsx
 data.xlsx.tmp
+data.db
+data.db-*
 logs/
 build/
 dist/
 *.spec
+.vrs_cache/
+_previews/

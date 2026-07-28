@@ -5,6 +5,7 @@ Dùng dataclass thay vì dict trần để lỗi cấu hình lộ ra sớm và I
 from __future__ import annotations
 
 import typing
+import shutil
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ class ChannelCfg:
 
 @dataclass
 class DownloadCfg:
+    enabled: bool = True          # False = only use local videos; disable YouTube download flow
+    auto_scan_enabled: bool = False
     root_dir: str = "D:/VideoRepurpose/downloads"
     channels: list[ChannelCfg] = field(default_factory=list)
     format: str = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
@@ -62,6 +65,8 @@ class TextOverlayCfg:
     seconds: float = 3.0
     position: str = "top"          # top | middle | bottom
     font_size: int = 48
+    style_preset: str = "soft_box"  # minimal | soft_box | highlight | title_bar | custom
+    safe_margin_percent: int = 5
     box: bool = True               # nền hộp bán trong suốt cho dễ đọc
     fade_ms: int = 300             # mờ dần vào/ra (0 = không)
     auto: bool = False             # hook: nếu text rỗng -> tự lấy câu mở đầu transcript
@@ -118,7 +123,14 @@ class SubtitleCfg:
     translate_to: str = ""         # "" = giữ NGÔN NGỮ GỐC; vd "en","vi","ja" = dịch sang
     burn_in: bool = True           # hiển thị phụ đề LÊN video (chỉ ngôn ngữ đã chọn)
     position: str = "bottom"       # top | middle | bottom
-    font_size: int = 24
+    font_size: int = 14
+    font_color: str = "#FFFFFF"
+    background_color: str = "#000000"
+    background_opacity: float = 0.55
+    margin_left_percent: int = 0
+    margin_right_percent: int = 0
+    margin_top_percent: int = 0
+    margin_bottom_percent: int = 0
     merge_gap_ms: int = 300        # gộp cue cách nhau < ngưỡng (đoạn ngắn gần nhau)
     min_cue_ms: int = 1200         # cue ngắn hơn -> gộp với lân cận để dịch không sai lời
     max_cue_ms: int = 7000         # trần độ dài 1 cue sau khi gộp
@@ -150,6 +162,9 @@ class ExportCfg:
     output_short_edge: int = 0     # 0 = tự chọn theo nguồn; 720/1080/1440/2160
     audio_bitrate_kbps: int = 256
     copy_audio_when_unchanged: bool = True
+    # Nếu FFmpeg không phát bất kỳ tiến triển nào trong thời gian này thì coi là kẹt.
+    # 0 = tắt watchdog. Progress bình thường được FFmpeg phát nhiều lần mỗi giây.
+    render_stall_timeout_seconds: int = 300
 
 
 @dataclass
@@ -171,8 +186,11 @@ class EditorCfg:
     side_squeeze_percent: float = 0.0   # nén ngang nguồn ĐÚNG 16:9 trước khi reframe (0..10%)
     manual_focus_x: float = 0.5      # dùng khi crop_mode=manual (toạ độ chuẩn hoá 0..1)
     manual_focus_y: float = 0.5
-    fingerprint_enabled: bool = False  # biến đổi nhẹ MỖI video để chống trùng nội dung
+    fingerprint_enabled: bool = True   # biến đổi kỹ thuật nhẹ MỖI video; không phải bảo đảm bản quyền
     fingerprint_strength: float = 1.0  # 0..2 (hệ số biên độ biến đổi)
+    # Biến thiên FPS tối đa theo % khi fingerprint bật. 0.1% chỉ bỏ/lặp xấp xỉ
+    # một frame mỗi 33 giây ở nguồn 30 fps, không nội suy nên không làm mềm hình.
+    fingerprint_fps_percent: float = 0.1
     flip_horizontal: bool = False
     mirror_crop: bool = False
     speed: float = 0.98
@@ -195,6 +213,7 @@ class LoggingCfg:
 
 @dataclass
 class AppConfig:
+    schema_version: int = 1
     download: DownloadCfg = field(default_factory=DownloadCfg)
     editor: EditorCfg = field(default_factory=EditorCfg)
     logging: LoggingCfg = field(default_factory=LoggingCfg)
@@ -242,6 +261,7 @@ def load_config(path: str | Path) -> AppConfig:
         )
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     return AppConfig(
+        schema_version=int(raw.get("schema_version", 1) or 1),
         download=_build(DownloadCfg, raw.get("download", {})),
         editor=_build(EditorCfg, raw.get("editor", {})),
         logging=_build(LoggingCfg, raw.get("logging", {})),
@@ -252,5 +272,7 @@ def save_config(cfg: AppConfig, path: str | Path) -> None:
     import yaml
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    if p.is_file():
+        shutil.copy2(p, p.with_suffix(p.suffix + ".bak"))
     p.write_text(yaml.safe_dump(asdict(cfg), allow_unicode=True, sort_keys=False),
                  encoding="utf-8")

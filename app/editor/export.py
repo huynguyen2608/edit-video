@@ -29,7 +29,29 @@ _POS = {
     "bottom-right": "W-w-10:H-h-10",
 }
 # vị trí phụ đề -> Alignment ASS (numpad): 8=trên-giữa, 5=giữa, 2=dưới-giữa
-_SUB_ALIGN = {"top": 8, "middle": 5, "bottom": 2}
+_SUB_ALIGN = {"top": 8, "middle": 5, "bottom": 2, "blur_bottom": 2}
+
+
+def _ass_color(value: str, opacity: float = 1.0) -> str:
+    """Convert #RRGGBB + opacity to ASS &HAABBGGRR."""
+    text = str(value or "").strip().lstrip("#")
+    if len(text) != 6:
+        text = "FFFFFF"
+    try:
+        red, green, blue = (int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        red, green, blue = 255, 255, 255
+    alpha = 255 - round(max(0.0, min(1.0, float(opacity))) * 255)
+    return f"&H{alpha:02X}{blue:02X}{green:02X}{red:02X}"
+
+
+def _video_encode_args(codec: str, quality: int, preset: str) -> list[str]:
+    """Tham số chất lượng đúng cho từng họ encoder."""
+    if "qsv" in codec:
+        return ["-c:v", codec, "-global_quality", str(quality), "-preset", preset]
+    if "nvenc" in codec:
+        return ["-c:v", codec, "-cq", str(quality), "-preset", preset]
+    return ["-c:v", codec, "-crf", str(quality), "-preset", preset]
 
 
 def _escape_sub_path(path: str) -> str:
@@ -45,7 +67,31 @@ def _escape_sub_path(path: str) -> str:
 def _subtitle_filter(cfg, sub_path: str, out_w: int, out_h: int) -> str:
     scfg = cfg.subtitle
     align = _SUB_ALIGN.get(scfg.position, 2)
-    style = f"Alignment={align},FontSize={int(scfg.font_size)},MarginV=40,Outline=1,Shadow=0"
+    # Các giá trị UI lấy mốc cạnh ngắn 1080px để cùng một cỡ chữ có tỷ lệ
+    # thị giác nhất quán ở 720p, 1080p, 2K và 4K.
+    scale = max(0.35, min(out_w, out_h) / 1080.0)
+    font_size = max(8, int(round(int(scfg.font_size) * scale)))
+    def margin_px(value, extent: int) -> int:
+        percent = max(0.0, min(45.0, float(value)))
+        return int(round(extent * percent / 100.0))
+
+    margin_l = margin_px(getattr(scfg, "margin_left_percent", 0), out_w)
+    margin_r = margin_px(getattr(scfg, "margin_right_percent", 0), out_w)
+    if scfg.position == "top":
+        margin_v = margin_px(getattr(scfg, "margin_top_percent", 0), out_h)
+    elif scfg.position == "middle":
+        margin_v = 0
+    else:
+        margin_v = margin_px(getattr(scfg, "margin_bottom_percent", 0), out_h)
+    primary = _ass_color(getattr(scfg, "font_color", "#FFFFFF"))
+    background = _ass_color(
+        getattr(scfg, "background_color", "#000000"),
+        getattr(scfg, "background_opacity", 0.55))
+    style = (
+        f"Alignment={align},FontName=Segoe UI,FontSize={font_size},"
+        f"MarginL={margin_l},MarginR={margin_r},MarginV={margin_v},"
+        f"PrimaryColour={primary},BackColour={background},"
+        "BorderStyle=3,Outline=0,Shadow=0")
     return (f"subtitles={_escape_sub_path(sub_path)}:"
             f"original_size={out_w}x{out_h}:force_style='{style}'")
 
@@ -101,10 +147,26 @@ def _build_video_filter(cfg: EditorCfg, ri: RenderInputs, input_map: dict[str, i
         color_enabled=cg.enabled, mirror_crop=False,
     ))
 
-    # 3) speed (video) -> [sp]
+    # Burn phụ đề theo timestamp nguồn trước khi đổi PTS. Frame và chữ sẽ cùng
+    # nhanh/chậm theo cfg.speed nên luôn bám lời.
+    cur = "tf"
+    if cfg.subtitle.enabled and cfg.subtitle.burn_in and ri.subtitle_path:
+        out_w, out_h = video_ops.target_resolution(cfg.target_aspect, short_edge)
+        parts.append(
+            f"[{cur}]{_subtitle_filter(cfg, ri.subtitle_path, out_w, out_h)}[srcsub]")
+        cur = "srcsub"
+
+    # 3) speed (video + phụ đề nguồn) -> [sp]
     vset, _ = video_ops.speed_filters(cfg.speed)
-    parts.append(f"[tf]{vset}[sp]")
+    parts.append(f"[{cur}]{vset}[sp]")
     cur = "sp"
+    # Fingerprint FPS rất nhẹ, chỉ áp khi biết FPS nguồn. Dùng filter fps chuẩn
+    # (bỏ/lặp frame), không dùng nội suy quang học nên không làm mềm chi tiết ảnh.
+    fps_mul = float(getattr(cfg, "_fingerprint_fps_multiplier", 1.0) or 1.0)
+    if ri.src_fps > 0 and abs(fps_mul - 1.0) > 1e-9:
+        target_fps = max(1.0, float(ri.src_fps) * fps_mul)
+        parts.append(f"[{cur}]fps={target_fps:.6f}[fpf]")
+        cur = "fpf"
 
     # 4) overlay logo/watermark
     if cfg.overlay.enabled and cfg.overlay.image_path and "overlay" in input_map:
@@ -130,12 +192,6 @@ def _build_video_filter(cfg: EditorCfg, ri: RenderInputs, input_map: dict[str, i
         cur = "pp"
 
     # 6) phụ đề burn-in (chỉ ngôn ngữ đã chọn) — áp SAU khi đã về khung đích
-    if cfg.subtitle.enabled and cfg.subtitle.burn_in and ri.subtitle_path:
-        out_w, out_h = video_ops.target_resolution(cfg.target_aspect, short_edge)
-        parts.append(
-            f"[{cur}]{_subtitle_filter(cfg, ri.subtitle_path, out_w, out_h)}[sub]")
-        cur = "sub"
-
     # 7) chữ hook (giây đầu) + CTA (giây cuối) qua file .ass (libass tự đặt vị trí/size)
     if ri.overlay_ass_path:
         parts.append(f"[{cur}]subtitles={_escape_sub_path(ri.overlay_ass_path)}[hcta]")
@@ -177,7 +233,11 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
     fc = _build_video_filter(cfg, ri, input_map)
     # Chỉ dùng audio gốc nếu nguồn THỰC SỰ có track audio (tránh [0:a] rỗng -> ffmpeg lỗi).
     original = "0:a" if ri.has_audio else None
-    tempo_factor = max(1e-6, float(cfg.speed)) * max(1e-6, float(a.audio_speed))
+    replacement_audio = bool(
+        voiceover or (music and not original and not vocals))
+    effective_audio_speed = (
+        max(1e-6, float(a.audio_speed)) if replacement_audio else 1.0)
+    tempo_factor = max(1e-6, float(cfg.speed)) * effective_audio_speed
     needs_proc = (bool(a.pitch_shift_semitones)
                   or bool(getattr(a, "enhance_original_voice", False))
                   or abs(tempo_factor - 1.0) > 1e-6)
@@ -207,12 +267,10 @@ def build_command(cfg: EditorCfg, ri: RenderInputs, out_path: str,
         cmd += ["-ss", str(start)]
     cmd += ["-filter_complex", fc, "-map", "[vout]"]
     cmd += audio_map
-    cmd += [
-        "-c:v", cfg.export.video_codec,
-        "-cq" if "nvenc" in cfg.export.video_codec else "-crf", str(cfg.export.crf_or_cq),
-        "-preset", getattr(cfg.export, "encoder_preset", "medium"),
-        "-pix_fmt", "yuv420p",
-    ]
+    cmd += _video_encode_args(
+        cfg.export.video_codec, cfg.export.crf_or_cq,
+        getattr(cfg.export, "encoder_preset", "medium"))
+    cmd += ["-pix_fmt", "yuv420p"]
     if not a.mute_all:
         can_copy_audio = (getattr(cfg.export, "copy_audio_when_unchanged", True)
                           and original and not (voiceover or vocals or music or needs_proc)
@@ -271,7 +329,9 @@ def render(cfg: EditorCfg, ri: RenderInputs, out_path: str,
         rc, err = _run_ffmpeg_progress(
             cmd, duration_hint or duration or 0.0,
             progress_cb or (lambda _f: None), cancel_cb,
-            expected_frames=expected_frames)
+            expected_frames=expected_frames,
+            stall_timeout_seconds=int(
+                getattr(cfg.export, "render_stall_timeout_seconds", 300) or 0))
     except EditCancelled:
         Path(out_path).unlink(missing_ok=True)
         raise
@@ -281,7 +341,8 @@ def render(cfg: EditorCfg, ri: RenderInputs, out_path: str,
 
 
 def _run_ffmpeg_progress(cmd: list[str], duration_hint: float, progress_cb,
-                         cancel_cb=None, expected_frames: float = 0.0) -> tuple[int, str]:
+                         cancel_cb=None, expected_frames: float = 0.0,
+                         stall_timeout_seconds: int = 300) -> tuple[int, str]:
     """Chạy ffmpeg, đọc `-progress` từ stdout -> gọi progress_cb(fraction 0..1).
 
     stderr ghi ra FILE TẠM (không dùng PIPE) để tránh deadlock khi buffer stderr đầy
@@ -289,24 +350,32 @@ def _run_ffmpeg_progress(cmd: list[str], duration_hint: float, progress_cb,
     """
     import tempfile
     import threading
+    import time
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errf:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1)
         cancelled = threading.Event()
+        stalled = threading.Event()
+        last_activity = [time.monotonic()]
 
-        def watch_cancel():
+        def watch_process():
             while proc.poll() is None:
                 if cancel_cb and cancel_cb():
                     cancelled.set()
                     stop_process(proc)
                     return
+                if (stall_timeout_seconds > 0
+                        and time.monotonic() - last_activity[0] > stall_timeout_seconds):
+                    stalled.set()
+                    stop_process(proc)
+                    return
                 threading.Event().wait(0.1)
 
-        watcher = None
-        if cancel_cb:
-            watcher = threading.Thread(target=watch_cancel, name="ffmpeg-cancel", daemon=True)
-            watcher.start()
+        watcher = threading.Thread(target=watch_process, name="ffmpeg-watchdog", daemon=True)
+        watcher.start()
         for line in proc.stdout:                       # từng dòng key=value
             line = line.strip()
+            if line:
+                last_activity[0] = time.monotonic()
             if line.startswith("frame=") and expected_frames > 0:
                 try:
                     frame = int(line.split("=", 1)[1])
@@ -323,25 +392,32 @@ def _run_ffmpeg_progress(cmd: list[str], duration_hint: float, progress_cb,
                 progress_cb(max(
                     0.0, min(0.99, us / 1_000_000.0 / duration_hint)))
         rc = proc.wait()
-        if watcher:
-            watcher.join(timeout=0.3)
+        watcher.join(timeout=0.3)
         errf.seek(0)
         err = errf.read()
     if cancelled.is_set():
         raise EditCancelled("Đã dừng FFmpeg của video hiện tại")
+    if stalled.is_set():
+        raise RuntimeError(
+            f"FFmpeg không có tiến triển trong {stall_timeout_seconds} giây và đã được dừng. "
+            "Hãy kiểm tra codec GPU, track âm thanh hoặc thử libx264.")
     if rc == 0:
         progress_cb(1.0)
     return rc, err
 
 
 def preview_frame(cfg: EditorCfg, video_path: str, out_png: str,
-                  at_seconds: float = 1.0, ffmpeg: str = "ffmpeg") -> str:
+                  at_seconds: float = 1.0, ffmpeg: str = "ffmpeg",
+                  video_id: str = "") -> str:
     """Render MỘT khung hình đã reframe/biến đổi (không audio, không tách/transcribe)
     để XEM TRƯỚC nhanh khung hình đầu ra. Chỉ dùng cho video được chọn/đầu tiên."""
-    from . import smart_crop
+    from . import fingerprint, smart_crop
+    preview_cfg = (
+        fingerprint.apply(cfg, video_id)
+        if video_id and cfg.fingerprint_enabled else cfg)
     dims = smart_crop.probe_dimensions(video_path)
     ri = RenderInputs(video=video_path, src_w=dims.width, src_h=dims.height, has_audio=False)
-    fc = _build_video_filter(cfg, ri, {"video": 0})   # chỉ nhánh video (không overlay/pip/sub)
+    fc = _build_video_filter(preview_cfg, ri, {"video": 0})   # chỉ nhánh video
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     cmd = [ffmpeg, "-y", "-ss", str(at_seconds), "-i", video_path,
            "-filter_complex", fc, "-map", "[vout]", "-frames:v", "1", out_png]
@@ -364,9 +440,8 @@ def make_short_from_full(full_path: str, out_path: str, seconds: float,
         cmd += ["-ss", f"{start:.3f}"]
     cmd += ["-i", full_path, "-t", str(seconds)]
     if accurate:
-        cmd += ["-c:v", video_codec,
-                "-cq" if "nvenc" in video_codec else "-crf", str(quality),
-                "-c:a", "aac", "-b:a", "192k"]
+        cmd += _video_encode_args(video_codec, quality, "medium")
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-c", "copy"]
     cmd += [out_path]

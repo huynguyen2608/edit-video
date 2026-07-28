@@ -75,6 +75,8 @@ t11 = _load_test("test_queue")
 t12 = _load_test("test_sqlite_store")
 t13 = _load_test("test_smart_crop")
 t14 = _load_test("test_reconcile")
+t15 = _load_test("test_source_subtitles")
+t16 = _load_test("test_source_controller")
 
 
 def run_module(mod) -> tuple[int, int]:
@@ -97,7 +99,7 @@ def run_module(mod) -> tuple[int, int]:
 
 def main() -> None:
     total_p = total_f = 0
-    for mod in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14):
+    for mod in (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16):
         print(f"== {mod.__name__} ==")
         p, f = run_module(mod)
         total_p += p

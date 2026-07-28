@@ -71,6 +71,13 @@ def translate_cues(cues, target: str, source: Optional[str] = None,
     except Exception as e:
         log.exception("Dịch lỗi: %s", e)
         return cues, False
+    if len(translated) != len(cues) or any(
+            not isinstance(text, str) or not text.strip()
+            for text in translated):
+        log.warning(
+            "Bản dịch không đầy đủ (%d/%d câu); giữ nguyên phụ đề nguồn.",
+            len(translated), len(cues))
+        return cues, False
     for c, t in zip(cues, translated):
         c.text2 = (t or "").strip()
     return cues, True

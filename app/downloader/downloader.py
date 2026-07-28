@@ -117,7 +117,14 @@ class YtDlpDownloader:
             "windowsfilenames": True,
             "trim_file_name": 120,
             "merge_output_format": "mp4",
-            # Chỉ tải đúng 1 file video; KHÔNG kèm thumbnail/.info.json (không dùng tới).
+            # Ưu tiên phụ đề do kênh cung cấp; nếu thiếu thì lấy phụ đề tự động.
+            # Chuẩn hóa về SRT để pipeline edit có thể dùng lại trực tiếp.
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            # Sẽ được thu hẹp xuống đúng ngôn ngữ nguồn sau bước probe.
+            "subtitleslangs": ["all", "-live_chat"],
+            "subtitlesformat": "srt/best",
+            # Không kèm thumbnail/.info.json vì pipeline không sử dụng.
             "writethumbnail": False,
             "writeinfojson": False,
             "noprogress": True,
@@ -187,6 +194,10 @@ class YtDlpDownloader:
                 # Probe trước (không tải): bỏ qua video ĐANG LIVE/premiere — nếu tải sẽ
                 # chạy vô hạn theo luồng trực tiếp và kẹt ở 'downloading'.
                 probe = ydl.extract_info(url, download=False)
+                subtitle_langs = self._select_subtitle_languages(probe or {})
+                # Không tải hàng trăm bản dịch tự động. Chỉ lấy một sidecar nguồn
+                # tốt nhất; writesubtitles luôn được ưu tiên trước automatic captions.
+                ydl.params["subtitleslangs"] = subtitle_langs
                 if cancel_cb and cancel_cb():
                     raise DownloadCancelled("Người dùng đã dừng tải")
                 status = (probe or {}).get("live_status")
@@ -201,6 +212,31 @@ class YtDlpDownloader:
                 return DownloadResult(video_id, False, error="Tải xong nhưng không thấy file output")
             log.info("Đã tải %s -> %s", video_id, fp)
             return DownloadResult(video_id, True, filepath=str(fp))
+
+    @staticmethod
+    def _select_subtitle_languages(info: dict) -> list[str]:
+        """Chọn một ngôn ngữ nguồn: manual trước, automatic sau."""
+        source = str(info.get("language") or "").lower()
+        manual = {
+            key for key in (info.get("subtitles") or {})
+            if key != "live_chat"
+        }
+        automatic = {
+            key for key in (info.get("automatic_captions") or {})
+            if key != "live_chat"
+        }
+
+        def choose(options: set[str]) -> str:
+            if not options:
+                return ""
+            for candidate in (source, f"{source}-orig" if source else ""):
+                if candidate and candidate in options:
+                    return candidate
+            originals = sorted(key for key in options if key.endswith("-orig"))
+            return originals[0] if originals else sorted(options)[0]
+
+        selected = choose(manual) or choose(automatic)
+        return [selected] if selected else []
 
     @staticmethod
     def _locate_output(out_dir: Path, video_id: str, info: dict | None) -> Optional[Path]:

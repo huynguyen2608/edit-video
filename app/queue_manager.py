@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .editor import local_source
 from .editor.stages import Status
+from .job_state import canonical_job_status
 from .paths import safe_name
 from .store import ExcelStore
 
@@ -31,21 +32,8 @@ class Job:
 
 
 def display_status(row) -> str:
-    """Suy ra trạng thái Queue từ 1 dòng video (edit_status là gốc cho done/failed)."""
-    ed = getattr(row, "edit_status", None) if not isinstance(row, dict) else row.get("edit_status")
-    js = getattr(row, "job_status", None) if not isinstance(row, dict) else row.get("job_status")
-    if js == Status.REMOVED:
-        return Status.REMOVED
-    if ed == "done":
-        return Status.COMPLETED
-    if js in (Status.PAUSED, Status.CANCELLED, Status.INTERRUPTED,
-              Status.PREPARING, Status.PROCESSING, Status.RENDERING):
-        return js
-    if ed == "failed":
-        return Status.FAILED
-    if ed == "processing":
-        return Status.PROCESSING
-    return Status.WAITING
+    """Tương thích API cũ; trạng thái chuẩn nằm tại app.job_state."""
+    return canonical_job_status(row)
 
 
 class QueueManager:

@@ -52,10 +52,26 @@ def synthesize(text: str, output_path: str, *, language: str,
     if not clean:
         raise RuntimeError("Không có nội dung transcript để tạo giọng đọc.")
     selected = choose_voice(language, gender, voice)
+    path = synthesize_selected(
+        clean, output_path, selected_voice=selected,
+        rate_percent=rate_percent, cancel_cb=cancel_cb)
+    return path, selected
+
+
+def synthesize_selected(text: str, output_path: str, *, selected_voice: str,
+                        rate_percent: int = 0, cancel_cb=None) -> str:
+    """Tạo một cue bằng giọng đã chọn, tránh tải lại danh sách giọng cho từng cue."""
+    try:
+        import edge_tts
+    except ImportError as exc:
+        raise RuntimeError("Chưa cài edge-tts. Hãy cài requirements.txt rồi thử lại.") from exc
+    clean = " ".join((text or "").split())
+    if not clean:
+        raise RuntimeError("Không có nội dung transcript để tạo giọng đọc.")
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rate = f"{int(rate_percent):+d}%"
-    communicate = edge_tts.Communicate(clean, selected, rate=rate)
+    communicate = edge_tts.Communicate(clean, selected_voice, rate=rate)
 
     async def save_cancellable() -> None:
         try:
@@ -70,4 +86,4 @@ def synthesize(text: str, output_path: str, *, language: str,
             raise
 
     asyncio.run(save_cancellable())
-    return str(path), selected
+    return str(path)

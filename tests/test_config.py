@@ -2,6 +2,10 @@
 from app.config import _build, AppConfig, EditorCfg, DownloadCfg
 
 
+def test_config_schema_version_defaults_to_one():
+    assert AppConfig().schema_version == 1
+
+
 def test_nested_dataclasses_built():
     e = _build(EditorCfg, {
         "target_aspect": "1:1",
@@ -30,6 +34,12 @@ def test_defaults_kept_for_missing_sections():
     assert type(e.export).__name__ == "ExportCfg"       # section thiếu -> dataclass default
     assert e.export.make_full is True
     assert type(e.audio).__name__ == "AudioCfg"
+    assert e.fingerprint_enabled is True
+    assert e.fingerprint_fps_percent == 0.1
+    assert e.subtitle.font_size == 14
+    assert e.subtitle.font_color == "#FFFFFF"
+    assert e.subtitle.background_color == "#000000"
+    assert e.subtitle.background_opacity == 0.55
 
 
 def test_unknown_keys_ignored():
@@ -54,6 +64,18 @@ def test_download_update_period_options():
     assert d.scan_interval_minutes == 45
 
 
+def test_download_features_are_enabled_but_periodic_scan_is_opt_in():
+    d = DownloadCfg()
+    assert d.enabled is True
+    assert d.auto_scan_enabled is False
+    loaded = _build(DownloadCfg, {
+        "enabled": False,
+        "auto_scan_enabled": True,
+    })
+    assert loaded.enabled is False
+    assert loaded.auto_scan_enabled is True
+
+
 def test_download_quality_setting():
     d = _build(DownloadCfg, {"quality_height": 720})
     assert d.quality_height == 720
@@ -71,6 +93,7 @@ def test_high_quality_export_defaults():
     assert e.export.crf_or_cq == 20 and e.export.encoder_preset == "medium"
     assert e.export.output_short_edge == 0
     assert e.export.audio_bitrate_kbps == 256
+    assert e.export.render_stall_timeout_seconds == 300
 
 
 def test_short_export_can_be_disabled_while_full_remains_enabled():

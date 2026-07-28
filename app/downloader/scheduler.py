@@ -148,6 +148,7 @@ class ScanService:
                 limit=getattr(self.cfg.download, "history_limit", 500))
                 if getattr(self.cfg.download, "history_scan", False)
                 else monitor.fetch_recent(cid))
+            missing_dates = 0
             for v in videos:
                 days = int(getattr(self.cfg.download, "lookback_days", 1))
                 days = days if days in {1, 7, 30, 60} else 1
@@ -155,12 +156,16 @@ class ScanService:
                 until = date.today().isoformat()
                 if not monitor.in_date_range(v.published, since, until):
                     if (since or until) and not v.published:
-                        self._log(f"  ! bỏ qua {v.video_id}: không xác định được ngày đăng")
+                        missing_dates += 1
                     continue
                 if self.db.add_discovered(v.video_id, cid, ch.name, v.title, v.url, v.published):
                     stats["discovered"] += 1
                     self._log(f"  + mới: {v.title} ({v.video_id})")
                     self.on_status(v.video_id, "row", "new")
+            if missing_dates:
+                self._log(
+                    f"  ! {missing_dates} video vẫn thiếu ngày đăng sau khi đã thử "
+                    "RSS và metadata chi tiết; không đưa vào sai khoảng thời gian.")
             self.db.mark_channel_scanned(cid)
         except Exception as e:
             self._log(f"  ! lỗi kênh {ch.name}: {e}")
