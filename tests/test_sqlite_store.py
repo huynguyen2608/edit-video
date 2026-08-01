@@ -2,6 +2,17 @@ from app.sqlite_store import SQLiteStore
 from app.store import ExcelStore
 
 
+def test_existing_sqlite_exports_table_gets_video_title_column(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE exports (video_id TEXT, channel_name TEXT, output_dir TEXT)")
+    db = SQLiteStore(path)
+    db.log_export("v", "channel", "out", video_title="Tên cũ")
+    assert db.recent_exports()[0]["video_title"] == "Tên cũ"
+
+
 def test_sqlite_persist_and_claim(tmp_path):
     path = tmp_path / "data.db"
     db = SQLiteStore(path)

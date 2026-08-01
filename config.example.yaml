@@ -117,6 +117,10 @@ editor:
     scale: 0.25 # tỉ lệ so với khung
     position: "bottom-right"
 
+  # Các vùng che nội dung đã nằm sẵn trong video nguồn. Nên tạo/chỉnh trực tiếp
+  # bằng preview trong tab Hình ảnh; tọa độ x/y/width/height là tỷ lệ 0..1.
+  mask_regions: []
+
   # ----- Audio fingerprint / xử lý -----
   audio:
     separate_speech: false # tách giữ giọng thoại, bỏ nhạc nền

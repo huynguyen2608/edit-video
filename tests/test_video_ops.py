@@ -128,6 +128,80 @@ def test_export_flip_is_full_frame_and_never_half_mirror():
     assert "hstack" not in graph and "crop=iw/2" not in graph
 
 
+def test_mask_regions_render_before_new_logo_and_support_three_modes():
+    from app.config import EditorCfg, MaskRegionCfg
+    from app.editor import export
+    e = EditorCfg()
+    e.mask_regions = [
+        MaskRegionCfg(mode="blur", x=.1, y=.2, width=.3, height=.1),
+        MaskRegionCfg(mode="pixelate", x=.2, y=.3, width=.2, height=.1),
+        MaskRegionCfg(mode="solid", x=.1, y=.8, width=.8, height=.1,
+                      color="#000000", opacity=.7),
+    ]
+    e.overlay.enabled = True; e.overlay.image_path = "logo.png"
+    ri = export.RenderInputs("in.mp4", 1080, 1920)
+    graph = export._build_video_filter(e, ri, {"video": 0, "overlay": 1})
+    assert "boxblur=" in graph
+    assert "flags=neighbor" in graph
+    assert "drawbox=" in graph
+    assert graph.index("drawbox=") < graph.index("[1:v]format=rgba")
+
+
+def test_mask_region_time_range_is_in_filter_graph():
+    from app.config import EditorCfg, MaskRegionCfg
+    from app.editor import export
+    e = EditorCfg(); e.speed = 1.0; e.mask_regions = [MaskRegionCfg(
+        mode="solid", start_seconds=2.5, end_seconds=8.0)]
+    graph = export._build_video_filter(
+        e, export.RenderInputs("in.mp4", 1920, 1080), {"video": 0})
+    assert "between(t\\,2.500\\,8.000)" in graph
+
+
+def test_mask_runs_before_new_subtitle_and_time_tracks_output_speed():
+    from app.config import EditorCfg, MaskRegionCfg
+    from app.editor import export
+    e = EditorCfg(); e.speed = 1.2
+    e.subtitle.enabled = True; e.subtitle.burn_in = True
+    e.mask_regions = [MaskRegionCfg(
+        mode="solid", start_seconds=2.0, end_seconds=5.0)]
+    graph = export._build_video_filter(
+        e, export.RenderInputs("in.mp4", 1920, 1080,
+                               subtitle_path="new.srt"), {"video": 0})
+    assert "between(t\\,2.400\\,6.000)" in graph
+    assert graph.index("drawbox=") < graph.index("subtitles=")
+
+
+def test_old_subtitle_mask_follows_new_subtitle_cues(tmp_path):
+    from app.config import EditorCfg, MaskRegionCfg
+    from app.editor import export
+    sub = tmp_path / "new.srt"
+    sub.write_text(
+        "1\n00:00:02,000 --> 00:00:04,000\nHello\n\n"
+        "2\n00:00:06,000 --> 00:00:07,000\nWorld\n",
+        encoding="utf-8")
+    e = EditorCfg()
+    e.subtitle.enabled = True; e.subtitle.burn_in = True
+    e.mask_regions = [MaskRegionCfg(
+        purpose="old_subtitle", mode="solid", timing_mode="subtitle",
+        subtitle_pad_before=.10, subtitle_pad_after=.15)]
+    graph = export._build_video_filter(
+        e, export.RenderInputs("in.mp4", 1920, 1080,
+                               subtitle_path=str(sub)), {"video": 0})
+    assert "between(t\\,1.900\\,4.150)" in graph
+    assert "between(t\\,5.900\\,7.150)" in graph
+    assert graph.index("drawbox=") < graph.index("subtitles=")
+
+
+def test_old_subtitle_mask_is_disabled_without_new_subtitle():
+    from app.config import EditorCfg, MaskRegionCfg
+    from app.editor import export
+    e = EditorCfg(); e.mask_regions = [MaskRegionCfg(
+        purpose="old_subtitle", mode="solid", timing_mode="subtitle")]
+    graph = export._build_video_filter(
+        e, export.RenderInputs("in.mp4", 1920, 1080), {"video": 0})
+    assert "enable='0'" in graph
+
+
 def test_reframe_pad_black_unaffected_by_side_crop():
     f = vo.build_reframe_filter(1920, 1080, "9:16", fill_missing="pad_black", side_crop_percent=5)
     assert "pad=" in f and "crop=trunc" not in f

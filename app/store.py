@@ -30,7 +30,7 @@ from typing import Optional
 from openpyxl import Workbook, load_workbook
 
 from .logging_setup import get_logger
-from .job_state import job_status_for_edit, normalize_persisted_row
+from .job_state import canonical_job_status, job_status_for_edit, normalize_persisted_row
 
 log = get_logger("store")
 
@@ -42,7 +42,7 @@ VIDEO_COLS = [
 ]
 CHANNEL_COLS = ["channel_id", "name", "url", "last_scanned"]
 # Log XUẤT BẢN: mỗi lần export ghi 1 dòng (3 file đầu ra + thời điểm).
-EXPORT_COLS = ["video_id", "channel_name", "full_path", "short_path",
+EXPORT_COLS = ["video_id", "video_title", "channel_name", "full_path", "short_path",
                "content_txt", "srt_path", "output_dir", "exported_at"]
 # Log LỊCH SỬ: dòng thời gian các sự kiện quan trọng (tải/edit/lỗi…).
 EVENT_COLS = ["time", "level", "source", "message"]
@@ -316,17 +316,20 @@ class ExcelStore:
 
     def log_export(self, video_id: str, channel_name: str, output_dir: str,
                    full_path: str | None = None, short_path: str | None = None,
-                   content_txt: str | None = None, srt_path: str | None = None) -> None:
+                   content_txt: str | None = None, srt_path: str | None = None,
+                   video_title: str = "") -> None:
         """Ghi 1 dòng vào sheet 'exports' + 1 sự kiện lịch sử."""
         with self._lock:
             self._exports.append({
-                "video_id": video_id, "channel_name": channel_name,
+                "video_id": video_id, "video_title": video_title,
+                "channel_name": channel_name,
                 "full_path": full_path, "short_path": short_path,
                 "content_txt": content_txt, "srt_path": srt_path,
                 "output_dir": output_dir, "exported_at": _now(),
             })
+            shown_name = video_title.strip() or video_id
             self._events.append({"time": _now(), "level": "INFO", "source": "export",
-                                 "message": f"export {video_id} -> {output_dir}"})
+                                 "message": f"Kết thúc xuất bản: {shown_name} → {output_dir}"})
             if len(self._events) > _EVENTS_MAX:
                 self._events = self._events[-_EVENTS_MAX:]
             self._save()
@@ -471,6 +474,45 @@ class ExcelStore:
                 changed = normalize_persisted_row(r, interrupted=True) or changed
             if changed:
                 self._save()
+
+    def pause_edit_queue(self) -> int:
+        """Tạm dừng toàn bộ video đang xử lý hoặc đang chờ biên tập."""
+        from .editor.stages import Status
+        with self._lock:
+            changed = 0
+            pausable = Status.ACTIVE | {Status.WAITING, Status.INTERRUPTED}
+            for row in self._videos.values():
+                if (row.get("download_status") != "downloaded"
+                        or row.get("edit_status") in ("done", "failed")
+                        or canonical_job_status(row) not in pausable):
+                    continue
+                row["edit_status"] = "pending"
+                row["job_status"] = Status.PAUSED
+                row["stage"] = ""
+                changed += 1
+            if changed:
+                self._save()
+            return changed
+
+    def resume_paused_edits(self) -> int:
+        """Đưa toàn bộ video biên tập đang tạm dừng về hàng chờ FIFO."""
+        from .editor.stages import Status
+        with self._lock:
+            changed = 0
+            for row in self._videos.values():
+                if (row.get("download_status") != "downloaded"
+                        or row.get("edit_status") == "done"
+                        or canonical_job_status(row) != Status.PAUSED):
+                    continue
+                row["edit_status"] = "pending"
+                row["job_status"] = Status.WAITING
+                row["stage"] = ""
+                row["progress"] = 0
+                row["error"] = None
+                changed += 1
+            if changed:
+                self._save()
+            return changed
 
 
 def _read_sheet(ws, cols: list[str], key: str) -> dict[str, dict]:  # noqa: E302

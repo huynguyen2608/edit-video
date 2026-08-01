@@ -315,7 +315,9 @@ class EditQueueWidget(QTableWidget):
             text, action = "Xử lý ngay", "process_now"
         host = QWidget(); box = QHBoxLayout(host)
         box.setContentsMargins(8, 12, 8, 12)
-        b = QPushButton(text); b.setFixedHeight(30)
+        box.setAlignment(Qt.AlignCenter)
+        b = QPushButton(text); b.setFixedSize(96, 30)
+        b.setStyleSheet("min-height:0px;max-height:30px;padding:1px 8px;")
         b.clicked.connect(lambda _=False, v=job.video_id, a=action: self.action_requested.emit(v, a))
         box.addWidget(b)
         self.setCellWidget(row, 5, host)
@@ -885,9 +887,12 @@ class QueueTab(QWidget):
             self.on_start()
 
     def _primary_action(self):
-        if not self._worker or not self._worker.isRunning(): self.on_start()
-        elif self._worker.is_paused(): self.on_resume()
-        else: self.on_pause()
+        if self._worker and self._worker.isRunning():
+            self.on_pause()
+        elif self.qm.paused_ids():
+            self.on_resume()
+        else:
+            self.on_start()
 
     def on_start(self, preferred_id=None):
         if self._worker and self._worker.isRunning(): return
@@ -951,19 +956,32 @@ class QueueTab(QWidget):
         w.job_failed.connect(self._on_failed); w.job_cancelled.connect(self._on_cancelled)
         w.log.connect(self._on_log)
         w.queue_finished.connect(self._on_finished)
-        self.btn_primary.setText("Tạm dừng sau video này")
+        self.btn_primary.setText("Tạm dừng tất cả")
         self.btn_stop.setText("Tạm dừng video")
         self.btn_stop.show(); self.dash.set_running(True); w.start()
 
     def on_pause(self):
-        if self._worker:
-            self._worker.pause(); self.btn_primary.setText("Tiếp tục"); self.dash.set_running(True, True)
+        if self._worker and self._worker.isRunning():
+            self._worker.pause_all()
+            count = self.qm.pause_all()
+            self.btn_primary.setText("Đang tạm dừng tất cả…")
+            self.btn_primary.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.dash.set_running(False, True)
+            self.refresh()
+            self.data_changed.emit()
+            self.dash.state.setToolTip(
+                f"Đã chuyển {count} video đang xử lý hoặc đang chờ sang Tạm dừng.")
 
     def on_resume(self):
-        if self._worker:
-            self._worker.resume()
-            self.btn_primary.setText("Tạm dừng sau video này")
-            self.dash.set_running(True)
+        if self._worker and self._worker.isRunning():
+            return
+        count = self.qm.resume_paused()
+        self.refresh()
+        self.data_changed.emit()
+        if count:
+            self.btn_primary.setText("Bắt đầu hàng đợi")
+            self.on_start()
 
     def _process_now(self, vid):
         if self._worker and self._worker.isRunning():
@@ -1138,9 +1156,11 @@ class QueueTab(QWidget):
         if vid == self._current: self.preview.append_log(msg)
 
     def _on_finished(self):
-        self.btn_primary.setText("Bắt đầu hàng đợi")
+        paused = bool(self.qm.paused_ids())
+        self.btn_primary.setText("Tiếp tục tất cả" if paused else "Bắt đầu hàng đợi")
+        self.btn_primary.setEnabled(True)
         self.btn_stop.setText("Dừng"); self.btn_stop.hide(); self.btn_stop.setEnabled(True)
-        self.dash.set_running(False); self.refresh()
+        self.dash.set_running(False, paused); self.refresh()
         self.data_changed.emit()
 
     def _stop_thumb(self) -> None:

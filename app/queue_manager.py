@@ -136,6 +136,16 @@ class QueueManager:
     def resume(self) -> None:
         self.db.resume_queue()
 
+    def pause_all(self) -> int:
+        return self.db.pause_edit_queue()
+
+    def resume_paused(self) -> int:
+        return self.db.resume_paused_edits()
+
+    def paused_ids(self) -> list[str]:
+        return [r.get("video_id") for r in self.db.all_video_rows()
+                if display_status(r) == Status.PAUSED]
+
     def retry_failed(self) -> list[str]:
         ids = []
         for r in self.db.all_video_rows():

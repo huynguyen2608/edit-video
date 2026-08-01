@@ -74,6 +74,7 @@ class EditWorker(QThread):
         self.qm = QueueManager(cfg, db)
         self._stop = threading.Event()
         self._pause = threading.Event()
+        self._pause_all = threading.Event()
         self._skip_current = threading.Event()   # tạm dừng video hiện tại (không dừng cả queue)
         self._preferred_id = preferred_id
         self._last_emit = 0.0
@@ -90,7 +91,13 @@ class EditWorker(QThread):
         self._skip_current.set()
 
     def _should_cancel(self) -> bool:
-        return self._stop.is_set() or self._skip_current.is_set()
+        return (self._stop.is_set() or self._skip_current.is_set()
+                or self._pause_all.is_set())
+
+    def pause_all(self) -> None:
+        """Hủy tác vụ hiện tại; worker sẽ thoát sau khi chuyển nó sang Paused."""
+        self._pause_all.set()
+        self._pause.clear()
 
     def pause(self) -> None:
         self._pause.set()
@@ -119,6 +126,8 @@ class EditWorker(QThread):
                 break
             self._skip_current.clear()   # cờ skip chỉ áp cho video sắp xử lý
             self._process(vid)
+            if self._pause_all.is_set():
+                break
         self.queue_finished.emit()
 
     def _active_stages(self) -> list[str]:
@@ -145,7 +154,10 @@ class EditWorker(QThread):
     def _handle_cancel(self, vid: str) -> None:
         """Video hiện tại bị hủy giữa chừng: quyết định 'Tạm dừng' (skip) hay 'Gián đoạn' (stop)."""
         self.db.set_edit_status(vid, "pending", error=None)
-        if self._skip_current.is_set() and not self._stop.is_set():
+        if self._pause_all.is_set():
+            self.db.update_job(vid, job_status=Status.PAUSED, stage="")
+            self.status_changed.emit(vid, Status.PAUSED)
+        elif self._skip_current.is_set() and not self._stop.is_set():
             # Tạm dừng video hiện tại: chuyển TẠM DỪNG (đếm ở 'Đang chờ', hiển thị 'Tạm dừng'),
             # KHÔNG tự chạy lại — worker đi tiếp video kế/đã chọn, hoặc dừng nếu hết.
             self._skip_current.clear()

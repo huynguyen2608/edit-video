@@ -94,14 +94,34 @@ def main() -> None:
         return
 
     # GUI
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QPixmap
+    from PySide6.QtWidgets import QApplication, QSplashScreen
+
+    app = QApplication(sys.argv)
+    # MainWindow nhập các bộ xử lý video và dựng nhiều bảng nên lần mở đầu có thể
+    # mất vài giây. Hiển thị phản hồi ngay thay vì để người dùng nhìn terminal và
+    # tưởng ứng dụng đã treo.
+    splash_image = QPixmap(520, 150)
+    splash_image.fill(QColor("#0f172a"))
+    splash = QSplashScreen(splash_image)
+    splash.showMessage(
+        "Video Repurpose Studio\nĐang khởi động và nạp dữ liệu…",
+        Qt.AlignCenter, QColor("#f8fafc"))
+    splash.show()
+    app.processEvents()
+
     from app.ui.main_window import MainWindow
     from app.ui.theme import apply_theme
 
-    app = QApplication(sys.argv)
     apply_theme(app)
+    splash.showMessage(
+        "Video Repurpose Studio\nĐang dựng giao diện…",
+        Qt.AlignCenter, QColor("#f8fafc"))
+    app.processEvents()
     win = MainWindow(cfg, db, device=ai_device, config_path=CONFIG)
     win.show()
+    splash.finish(win)
     sys.exit(app.exec())
 
 

@@ -1,9 +1,21 @@
 """Test dựng config lồng nhau — lỗi từng khiến app crash (dict thay vì dataclass)."""
-from app.config import _build, AppConfig, EditorCfg, DownloadCfg
+from app.config import _build, AppConfig, EditorCfg, DownloadCfg, MaskRegionCfg
 
 
 def test_config_schema_version_defaults_to_one():
     assert AppConfig().schema_version == 1
+
+
+def test_mask_regions_load_as_dataclasses_and_keep_defaults():
+    editor = _build(EditorCfg, {"mask_regions": [{
+        "name": "Che phụ đề cũ", "mode": "solid", "x": .1,
+        "unknown_future_key": True,
+    }]})
+    assert len(editor.mask_regions) == 1
+    assert isinstance(editor.mask_regions[0], MaskRegionCfg)
+    assert editor.mask_regions[0].name == "Che phụ đề cũ"
+    assert editor.mask_regions[0].mode == "solid"
+    assert editor.mask_regions[0].width == .25
 
 
 def test_nested_dataclasses_built():

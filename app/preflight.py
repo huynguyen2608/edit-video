@@ -58,8 +58,11 @@ def check(cfg) -> list[str]:
         ("nhạc thay thế", bool(ecfg.audio.replace_music), ecfg.audio.replace_music),
         ("voiceover", bool(ecfg.audio.voiceover), ecfg.audio.voiceover),
     ):
-        if enabled and (not path or not Path(path).is_file()):
-            warnings.append(f"Đã bật {label} nhưng file không tồn tại: {path or '(trống)'}")
+        # Đường dẫn rỗng là trạng thái "chưa chọn file", đã được giao diện hiển thị
+        # ngay tại thiết lập tương ứng. Chỉ cảnh báo ở terminal khi người dùng đã
+        # chọn một đường dẫn cụ thể nhưng file thực sự không còn tồn tại.
+        if enabled and path and not Path(path).is_file():
+            warnings.append(f"Đã bật {label} nhưng file không tồn tại: {path}")
     return warnings
 
 

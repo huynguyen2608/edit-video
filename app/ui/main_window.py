@@ -15,7 +15,7 @@ import shutil
 from copy import deepcopy
 from pathlib import Path
 
-from PySide6.QtCore import (Qt, QObject, Signal, QRect, QSize, QPoint, QEvent,
+from PySide6.QtCore import (Qt, QObject, Signal, QRect, QRectF, QSize, QPoint, QPointF, QEvent,
                             QTimer, QFileSystemWatcher, QThread)
 from PySide6.QtGui import QPixmap, QPainter, QPen, QColor
 from PySide6.QtWidgets import (
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QColorDialog, QSplitter, QFrame, QInputDialog,
 )
 
-from ..config import AppConfig, EditorCfg, save_config
+from ..config import AppConfig, EditorCfg, MaskRegionCfg, save_config
 from ..source_controller import SourceController, SourceError
 from ..store import ExcelStore
 from ..logging_setup import get_logger
@@ -213,6 +213,9 @@ class _PosCanvas(QLabel):
 class _InteractivePreview(QLabel):
     """Preview co giãn, click trực tiếp để đặt phụ đề/logo/hook/CTA."""
     clicked = Signal(float, float)
+    mask_changed = Signal(int, float, float, float, float)
+    mask_selected = Signal(int)
+    mask_edit_finished = Signal(int)
 
     def __init__(self, text: str = ""):
         super().__init__(text)
@@ -220,7 +223,16 @@ class _InteractivePreview(QLabel):
         self._markers: dict[str, tuple[float, float]] = {}
         self._active = "logo"
         self._safe_margins = (0.0, 0.0, 0.0, 0.0)
+        self._mask_rects = []
+        self._mask_visible = []
+        self._mask_locked = []
+        self._mask_names = []
+        self._active_mask = -1
+        self._drag = None
+        self._mask_allowed: set[int] | None = None
+        self._edit_chrome = False
         self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
 
     def set_source(self, pixmap: QPixmap) -> None:
         self._source = pixmap
@@ -233,6 +245,38 @@ class _InteractivePreview(QLabel):
     def set_active(self, key: str) -> None:
         self._active = key
         self.update()
+
+    def set_masks(self, masks, active: int = -1) -> None:
+        self._mask_rects = [(float(m.x), float(m.y), float(m.width), float(m.height))
+                            for m in masks]
+        self._mask_visible = [bool(getattr(m, "visible", True)) for m in masks]
+        self._mask_locked = [bool(getattr(m, "locked", False)) for m in masks]
+        self._mask_names = [str(getattr(m, "name", "") or f"Vùng che {i + 1}")
+                            for i, m in enumerate(masks)]
+        self._active_mask = active
+        if active >= 0:
+            self._active = "mask"
+        self.update()
+
+    def set_active_mask(self, index: int) -> None:
+        self._active = "mask"
+        self._active_mask = index
+        self.update()
+
+    def set_mask_context(self, indices=None) -> None:
+        """Limit interactive mask overlays without changing render config."""
+        self._mask_allowed = None if indices is None else set(indices)
+        self.update()
+
+    def set_edit_chrome(self, enabled: bool) -> None:
+        self._edit_chrome = bool(enabled)
+        if not enabled:
+            self._drag = None
+            self.unsetCursor()
+        self.update()
+
+    def _mask_is_available(self, index: int) -> bool:
+        return (self._mask_allowed is None or index in self._mask_allowed)
 
     def set_safe_margins(self, left: float, right: float,
                          top: float, bottom: float) -> None:
@@ -252,6 +296,8 @@ class _InteractivePreview(QLabel):
                 Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def mousePressEvent(self, event) -> None:
+        if not self._edit_chrome:
+            return
         pix = self.pixmap()
         if pix is None or pix.isNull():
             return
@@ -259,8 +305,113 @@ class _InteractivePreview(QLabel):
         y0 = (self.height() - pix.height()) / 2
         fx = (event.position().x() - x0) / max(1, pix.width())
         fy = (event.position().y() - y0) / max(1, pix.height())
+        if self._active == "mask" and 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
+            order = list(range(len(self._mask_rects) - 1, -1, -1))
+            if self._active_mask in order:
+                order.remove(self._active_mask); order.insert(0, self._active_mask)
+            for index in order:
+                if not self._mask_is_available(index):
+                    continue
+                if index < len(self._mask_visible) and not self._mask_visible[index]:
+                    continue
+                x, y, w, h = self._mask_rects[index]
+                if x - .015 <= fx <= x + w + .015 and y - .015 <= fy <= y + h + .015:
+                    self._active_mask = index
+                    self.mask_selected.emit(index)
+                    if index < len(self._mask_locked) and self._mask_locked[index]:
+                        self.update()
+                        return
+                    # Vùng bắt cạnh đủ rộng để thao tác trên preview nhỏ nhưng
+                    # vẫn ưu tiên đúng bốn góc khi hai cạnh cùng được chạm.
+                    tol_x = max(.018, 8.0 / max(1, pix.width()))
+                    tol_y = max(.018, 8.0 / max(1, pix.height()))
+                    horizontal = "l" if abs(fx-x) < tol_x else ("r" if abs(fx-x-w) < tol_x else "")
+                    vertical = "t" if abs(fy-y) < tol_y else ("b" if abs(fy-y-h) < tol_y else "")
+                    self._drag = (horizontal + vertical or "move", fx, fy, x, y, w, h)
+                    self._set_mask_cursor(self._drag[0], dragging=True)
+                    self.update()
+                    return
+            return
         if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
             self.clicked.emit(fx, fy)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.pixmap() is None or self.pixmap().isNull():
+            return
+        if not self._drag:
+            self._update_mask_hover_cursor(event.position())
+            return
+        if self._active_mask < 0:
+            return
+        pix = self.pixmap(); x0 = (self.width() - pix.width()) / 2
+        y0 = (self.height() - pix.height()) / 2
+        fx = min(1.0, max(0.0, (event.position().x() - x0) / max(1, pix.width())))
+        fy = min(1.0, max(0.0, (event.position().y() - y0) / max(1, pix.height())))
+        mode, ox, oy, x, y, w, h = self._drag; dx, dy = fx-ox, fy-oy
+        if mode == "move":
+            x = min(1.0-w, max(0.0, x+dx)); y = min(1.0-h, max(0.0, y+dy))
+        else:
+            if "l" in mode:
+                nx = min(x+w-.02, max(0.0, x+dx)); w += x-nx; x = nx
+            if "r" in mode: w = min(1.0-x, max(.02, w+dx))
+            if "t" in mode:
+                ny = min(y+h-.02, max(0.0, y+dy)); h += y-ny; y = ny
+            if "b" in mode: h = min(1.0-y, max(.02, h+dy))
+        self._mask_rects[self._active_mask] = (x, y, w, h)
+        self.mask_changed.emit(self._active_mask, x, y, w, h)
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        edited_mask = self._active_mask if self._drag else -1
+        self._drag = None
+        self._update_mask_hover_cursor(event.position())
+        if edited_mask >= 0:
+            self.mask_edit_finished.emit(edited_mask)
+
+    def leaveEvent(self, event) -> None:
+        if not self._drag:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+    def _set_mask_cursor(self, mode: str, dragging: bool = False) -> None:
+        cursors = {
+            "lt": Qt.SizeFDiagCursor, "rb": Qt.SizeFDiagCursor,
+            "rt": Qt.SizeBDiagCursor, "lb": Qt.SizeBDiagCursor,
+            "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+            "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+            "move": Qt.ClosedHandCursor if dragging else Qt.SizeAllCursor,
+        }
+        self.setCursor(cursors.get(mode, Qt.ArrowCursor))
+
+    def _update_mask_hover_cursor(self, position) -> None:
+        """Đổi biểu tượng chuột theo cạnh/góc/vùng có thể thao tác."""
+        if not self._edit_chrome or self._active != "mask" or self.pixmap() is None:
+            self.unsetCursor(); return
+        pix = self.pixmap()
+        x0 = (self.width() - pix.width()) / 2
+        y0 = (self.height() - pix.height()) / 2
+        fx = (position.x() - x0) / max(1, pix.width())
+        fy = (position.y() - y0) / max(1, pix.height())
+        tol_x = max(.018, 8.0 / max(1, pix.width()))
+        tol_y = max(.018, 8.0 / max(1, pix.height()))
+        order = list(range(len(self._mask_rects) - 1, -1, -1))
+        if self._active_mask in order:
+            order.remove(self._active_mask); order.insert(0, self._active_mask)
+        for index in order:
+            if not self._mask_is_available(index):
+                continue
+            if index < len(self._mask_visible) and not self._mask_visible[index]:
+                continue
+            x, y, w, h = self._mask_rects[index]
+            if not (x-tol_x <= fx <= x+w+tol_x and y-tol_y <= fy <= y+h+tol_y):
+                continue
+            if index < len(self._mask_locked) and self._mask_locked[index]:
+                self.setCursor(Qt.ForbiddenCursor); return
+            horizontal = "l" if abs(fx-x) <= tol_x else ("r" if abs(fx-x-w) <= tol_x else "")
+            vertical = "t" if abs(fy-y) <= tol_y else ("b" if abs(fy-y-h) <= tol_y else "")
+            self._set_mask_cursor(horizontal + vertical or "move")
+            return
+        self.unsetCursor()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -270,7 +421,7 @@ class _InteractivePreview(QLabel):
         x0 = (self.width() - pix.width()) / 2
         y0 = (self.height() - pix.height()) / 2
         painter = QPainter(self)
-        if self._active in ("subtitle", "hook", "cta"):
+        if self._edit_chrome and self._active in ("subtitle", "hook", "cta"):
             left, right, top, bottom = self._safe_margins
             safe_x = x0 + pix.width() * left
             safe_y = y0 + pix.height() * top
@@ -285,12 +436,44 @@ class _InteractivePreview(QLabel):
             "subtitle": "#e879f9", "logo": "#22c55e",
             "hook": "#38bdf8", "cta": "#fb923c"}
         letters = {"subtitle": "S", "logo": "L", "hook": "H", "cta": "C"}
-        for key, (fx, fy) in self._markers.items():
+        # Khi chỉnh vùng che, các marker Logo/Hook/CTA chỉ tạo nhiễu và dễ khiến
+        # người dùng kéo nhầm đối tượng. Chúng vẫn hiện ở các chế độ đặt vị trí cũ.
+        visible_markers = (
+            {self._active: self._markers[self._active]}
+            if self._edit_chrome and self._active != "mask"
+            and self._active in self._markers else {})
+        for key, (fx, fy) in visible_markers.items():
             x = x0 + fx * pix.width(); y = y0 + fy * pix.height()
             width = 4 if key == self._active else 2
             painter.setPen(QPen(QColor(colors.get(key, "#ffffff")), width))
             painter.drawEllipse(int(x) - 10, int(y) - 10, 20, 20)
             painter.drawText(int(x) - 4, int(y) + 5, letters.get(key, "•"))
+        for index, (fx, fy, fw, fh) in enumerate(self._mask_rects):
+            if not self._edit_chrome or not self._mask_is_available(index):
+                continue
+            if index < len(self._mask_visible) and not self._mask_visible[index]:
+                continue
+            rect = QRectF(x0 + fx * pix.width(), y0 + fy * pix.height(),
+                          fw * pix.width(), fh * pix.height())
+            active = self._active == "mask" and index == self._active_mask
+            painter.setPen(QPen(QColor("#fb923c"), 3 if active else 1))
+            painter.setBrush(QColor(251, 146, 60, 34 if active else 18))
+            painter.drawRect(rect)
+            if active:
+                painter.setBrush(QColor("#ffffff"))
+                points = (
+                    rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight(),
+                    QPointF(rect.center().x(), rect.top()),
+                    QPointF(rect.center().x(), rect.bottom()),
+                    QPointF(rect.left(), rect.center().y()),
+                    QPointF(rect.right(), rect.center().y()),
+                )
+                for point in points:
+                    painter.drawRect(QRectF(point.x() - 5, point.y() - 5, 10, 10))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(rect.adjusted(5, 4, -4, -4), Qt.AlignLeft | Qt.AlignTop,
+                             self._mask_names[index] if index < len(self._mask_names)
+                             else f"Vùng che {index + 1}")
         painter.end()
 
 
@@ -569,6 +752,8 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(_COLS)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setMinimumSectionSize(32)
+        self.table.verticalHeader().setDefaultSectionSize(32)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         make_columns_resizable(
@@ -1103,7 +1288,10 @@ class MainWindow(QMainWindow):
         nav.setMinimumWidth(125)
         nav.setMaximumWidth(155)
         nav.setStyleSheet("QListWidget::item { min-height: 34px; padding: 4px 10px; }")
-        nav.addItems(["Cơ bản", "Hình ảnh", "Âm thanh", "Phụ đề & dịch", "Thương hiệu"])
+        nav.addItems([
+            "Cơ bản", "Hình ảnh", "Âm thanh", "Phụ đề & dịch", "Thương hiệu",
+            "Che nội dung cũ",
+        ])
         nav.setCurrentRow(0)
         stack = QStackedWidget()
 
@@ -1119,40 +1307,79 @@ class MainWindow(QMainWindow):
         add_page(self._build_audio_settings_group())
         add_page(self._build_subtitle_group())
         add_page(self._build_hook_cta_logo_group())
+        # Công cụ che chữ/logo/phụ đề có sẵn là một quy trình riêng. Widget được
+        # dựng cùng nhóm hình ảnh để dùng chung cấu hình, nhưng hiển thị ở trang
+        # độc lập ngay dưới Thương hiệu để không làm thay đổi bố cục tab Hình ảnh.
+        add_page(self.mask_settings_widget)
         # Cả tab Âm thanh (ô Lồng tiếng) và Phụ đề (chk_sub) đã dựng xong -> đồng bộ lại
         # để ô 'Ngôn ngữ lồng tiếng' khóa đúng khi phụ đề bật (giọng bám theo 'Dịch sang').
         self._sync_voiceover_controls()
-        nav.currentRowChanged.connect(stack.setCurrentIndex)
+        nav.currentRowChanged.connect(
+            lambda index: self._on_editor_settings_page_changed(index, stack))
         preview_box = QGroupBox("Xem trước")
+        self.preview_box = preview_box
         pv = QVBoxLayout(preview_box)
         self.lbl_live_preview = _InteractivePreview(
             "Bấm “Tạo xem trước” để tạo khung hình\n\n"
             "Nếu chưa chọn thư mục nguồn, ứng dụng dùng video đang xử lý "
             "hoặc đang chọn trong Hàng đợi.")
         self.lbl_live_preview.clicked.connect(self._on_inline_position_click)
+        self.lbl_live_preview.mask_changed.connect(self._on_preview_mask_changed)
+        self.lbl_live_preview.mask_selected.connect(self._on_preview_mask_selected)
+        self.lbl_live_preview.mask_edit_finished.connect(
+            self._on_preview_mask_edit_finished)
         self.lbl_live_preview.setMinimumSize(260, 220)
         self.lbl_live_preview.setStyleSheet(
             "background:#0f172a;color:#cbd5e1;border-radius:6px;padding:12px;")
         self._on_subtitle_safe_frame_changed()
         pv.addWidget(self.lbl_live_preview, 1)
         position_row = QHBoxLayout()
-        position_row.addWidget(QLabel("Đặt vị trí:"))
+        self.cmb_preview_mode = self._data_combo([
+            ("result", "Kết quả"), ("edit", "Chỉnh khung")], "result")
+        self.cmb_preview_mode.setMaximumWidth(112)
+        self.cmb_preview_mode.setToolTip(
+            "Kết quả: xem khung hình sạch. Chỉnh khung: hiện viền và tay nắm của đối tượng đang chỉnh.")
+        self.cmb_preview_mode.currentIndexChanged.connect(
+            self._on_preview_mode_changed)
+        position_row.addWidget(self.cmb_preview_mode)
+        # Mục tiêu đặt vị trí được suy ra từ trang cài đặt đang mở. Không cho
+        # người dùng chọn lại ở đây vì sẽ tạo hai nguồn điều khiển cùng một giá trị.
+        self.lbl_preview_target = QLabel("Đang chỉnh:")
+        position_row.addWidget(self.lbl_preview_target)
+        self.lbl_preview_target.hide()
         self.cmb_preview_target = QComboBox()
         self.cmb_preview_target.addItem("Phụ đề", "subtitle")
         self.cmb_preview_target.addItem("Logo", "logo")
         self.cmb_preview_target.addItem("Hook", "hook")
         self.cmb_preview_target.addItem("CTA", "cta")
+        self.cmb_preview_target.addItem("Vùng che", "mask")
         self.cmb_preview_target.currentIndexChanged.connect(self._on_preview_target_changed)
-        position_row.addWidget(self.cmb_preview_target)
+        self.cmb_preview_target.hide()  # chỉ giữ làm trạng thái nội bộ
+        self.lbl_preview_context = QLabel("Phụ đề")
+        self.lbl_preview_context.setStyleSheet("font-weight:600;color:#334155;")
+        position_row.addWidget(self.lbl_preview_context)
+        self.lbl_preview_context.hide()
         self.lbl_preview_position = QLabel("Click lên ảnh")
         self.lbl_preview_position.setStyleSheet("color:#64748b;")
+        # Cho phần mô tả co lại trước, giữ nguyên chiều rộng của nút hành động.
+        self.lbl_preview_position.setMinimumWidth(0)
+        self.lbl_preview_position.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred)
         position_row.addWidget(self.lbl_preview_position, 1)
-        btn_refresh = QPushButton("Xem trước bản nháp")
-        btn_refresh.setToolTip(
+        self.sp_preview_time = self._spin(QDoubleSpinBox, 0, 86400, 1, 1)
+        self.sp_preview_time.setSuffix(" s")
+        self.sp_preview_time.setMaximumWidth(78)
+        self.sp_preview_time.setToolTip("Khung thời gian dùng để kiểm tra vùng che và các lớp chữ.")
+        position_row.addWidget(self.sp_preview_time)
+        self.btn_preview_refresh = QPushButton("Xem trước bản nháp")
+        self.btn_preview_refresh.setMinimumWidth(142)
+        self.btn_preview_refresh.setSizePolicy(
+            QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self.btn_preview_refresh.setToolTip(
             "Tạo một khung hình theo đúng cấu hình hiện tại. "
             "Xử lý nhiều video được thực hiện trong tab Hàng đợi.")
-        btn_refresh.clicked.connect(lambda: self.on_preview(batch=False))
-        position_row.addWidget(btn_refresh)
+        self.btn_preview_refresh.clicked.connect(lambda: self.on_preview(batch=False))
+        position_row.addWidget(self.btn_preview_refresh)
         pv.addLayout(position_row)
         ebrand = self.cfg.editor
         for key, pos in (("subtitle", ebrand.subtitle.position),
@@ -1162,7 +1389,9 @@ class MainWindow(QMainWindow):
             fx, fy = self._position_point(key, pos)
             self.lbl_live_preview.set_marker(key, fx, fy)
         self.lbl_live_preview.set_active("subtitle")
+        self._sync_masks_to_preview()
         self._on_preview_target_changed()
+        self._on_preview_mode_changed()
         preview_box.setMinimumWidth(280)
         preview_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         settings_host = QWidget()
@@ -1197,11 +1426,14 @@ class MainWindow(QMainWindow):
         btn_pick.clicked.connect(self.on_pick_input_folder)
         frow.addWidget(btn_pick)
         lay.addLayout(frow)
+        # currentRow được đặt trước khi nối signal, vì vậy cần đồng bộ trạng thái
+        # preview lần đầu để trang Cơ bản không hiện điều khiển đặt vị trí thừa.
+        self._on_editor_settings_page_changed(nav.currentRow(), stack)
         return root
 
     # ---------------- Tab Lịch sử / Xuất bản ----------------
-    _EXPORT_HDR = ["Video", "Kênh", "Tệp đã xuất", "Thư mục", "Thời gian"]
-    _EVENT_HDR = ["Thời gian", "Mức độ", "Nguồn", "Nội dung"]
+    _EXPORT_HDR = ["Video ID", "Tên video", "Kênh", "Tệp đã xuất", "Thư mục", "Thời gian"]
+    _EVENT_HDR = ["Thời gian", "Trạng thái", "Nguồn", "Nội dung"]
 
     def _build_history_tab(self) -> QWidget:
         w = QWidget()
@@ -1261,9 +1493,11 @@ class MainWindow(QMainWindow):
         self.tbl_exports.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tbl_exports.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl_exports.setAlternatingRowColors(True); self.tbl_exports.setShowGrid(False)
+        self.tbl_exports.verticalHeader().setMinimumSectionSize(32)
+        self.tbl_exports.verticalHeader().setDefaultSectionSize(32)
         self.tbl_exports.cellDoubleClicked.connect(self._open_export_dir)
         make_columns_resizable(
-            self.tbl_exports, [2.2, 1.2, 1.7, 1.1, 1.45],
+            self.tbl_exports, [1.15, 2.8, 1.2, 1.35, 1.0, 1.4],
             min_width=80)
         self.lbl_exports_empty = QLabel("Chưa có video nào được xuất bản\nKết quả sẽ xuất hiện tại đây sau khi hoàn thành biên tập.")
         self.lbl_exports_empty.setAlignment(Qt.AlignCenter)
@@ -1280,8 +1514,12 @@ class MainWindow(QMainWindow):
         self.history_search.setMinimumWidth(250)
         self.history_search.textChanged.connect(self._apply_event_filters); filters.addWidget(self.history_search)
         self.history_level = QComboBox()
-        self.history_level.addItem("Tất cả mức độ", "all")
-        self.history_level.addItem("Chỉ lỗi", "ERROR"); self.history_level.addItem("Thông tin", "INFO")
+        self.history_level.addItem("Tất cả trạng thái", "all")
+        self.history_level.addItem("Bắt đầu", "started")
+        self.history_level.addItem("Hoàn thành", "completed")
+        self.history_level.addItem("Đã dừng", "stopped")
+        self.history_level.addItem("Lỗi", "error")
+        self.history_level.addItem("Thông tin khác", "info")
         self.history_level.currentIndexChanged.connect(self._apply_event_filters); filters.addWidget(self.history_level)
         self.history_source = QComboBox(); self.history_source.addItem("Tất cả nguồn", "all")
         self.history_source.currentIndexChanged.connect(self._apply_event_filters); filters.addWidget(self.history_source)
@@ -1312,6 +1550,11 @@ class MainWindow(QMainWindow):
                 tbl.setItem(i, j, QTableWidgetItem("" if v is None else str(v)))
 
     def _reload_history(self) -> None:
+        self._history_video_titles = {
+            str(row.get("video_id") or ""): str(row.get("title") or "")
+            for row in self.db.all_video_rows()
+            if row.get("video_id")
+        }
         exports = list(reversed(self.db.recent_exports()))
         self._fill_exports(exports)
         self._history_events = list(reversed(self.db.recent_events()))
@@ -1319,7 +1562,8 @@ class MainWindow(QMainWindow):
         sources = sorted({str(e.get("source") or "khác") for e in self._history_events})
         self.history_source.blockSignals(True); self.history_source.clear()
         self.history_source.addItem("Tất cả nguồn", "all")
-        for source in sources: self.history_source.addItem(source.capitalize(), source)
+        for source in sources:
+            self.history_source.addItem(self._event_source_label(source), source)
         idx = self.history_source.findData(current_source)
         self.history_source.setCurrentIndex(max(0, idx)); self.history_source.blockSignals(False)
         self._apply_event_filters()
@@ -1339,19 +1583,36 @@ class MainWindow(QMainWindow):
                     files.append(label)
             values = [
                 str(data.get("video_id") or ""),
+                str(data.get("video_title") or self._history_video_titles.get(
+                    str(data.get("video_id") or ""), "")),
                 str(data.get("channel_name") or ""),
                 " · ".join(files) if files else "—",
                 "Mở thư mục",
                 str(data.get("exported_at") or ""),
             ]
             tooltips = [
-                values[0], values[1], values[2],
-                str(data.get("output_dir") or ""), values[4],
+                values[0], values[1], values[2], values[3],
+                str(data.get("output_dir") or ""), values[5],
             ]
             for col, shown in enumerate(values):
                 item = QTableWidgetItem(shown)
                 item.setToolTip(tooltips[col])
+                if col in (3, 4, 5):
+                    item.setTextAlignment(Qt.AlignCenter)
                 self.tbl_exports.setItem(row, col, item)
+            folder_host = QWidget()
+            folder_layout = QHBoxLayout(folder_host)
+            folder_layout.setContentsMargins(4, 1, 4, 1)
+            folder_layout.setAlignment(Qt.AlignCenter)
+            folder_button = QPushButton("Mở thư mục")
+            folder_button.setFixedSize(96, 30)
+            folder_button.setStyleSheet(
+                "min-height:0px;max-height:30px;padding:1px 8px;")
+            folder_button.clicked.connect(
+                lambda _checked=False, current_row=row:
+                self._open_export_dir(current_row, 4))
+            folder_layout.addWidget(folder_button)
+            self.tbl_exports.setCellWidget(row, 4, folder_host)
         self.lbl_exports_empty.setVisible(not rows)
         self.tbl_exports.setVisible(bool(rows))
         self._apply_export_filter()
@@ -1365,7 +1626,7 @@ class MainWindow(QMainWindow):
         for row in range(self.tbl_exports.rowCount()):
             text = " ".join(
                 self.tbl_exports.item(row, col).text()
-                for col in (0, 1, 2)
+                for col in (0, 1, 2, 3)
                 if self.tbl_exports.item(row, col) is not None
             ).lower()
             self.tbl_exports.setRowHidden(row, bool(query and query not in text))
@@ -1373,22 +1634,57 @@ class MainWindow(QMainWindow):
     def _apply_event_filters(self, *_):
         if not hasattr(self, "_history_events"): return
         query = self.history_search.text().strip().lower()
-        level = self.history_level.currentData(); source = self.history_source.currentData()
+        status = self.history_level.currentData(); source = self.history_source.currentData()
         rows = [e for e in self._history_events
-                if (level == "all" or str(e.get("level", "")).upper() == level)
+                if (status == "all" or self._event_status(e)[0] == status)
                 and (source == "all" or str(e.get("source") or "khác") == source)
-                and (not query or query in str(e.get("message", "")).lower())]
-        self._fill_table(self.tbl_events, rows, ["time", "level", "source", "message"])
+                and (not query or query in self._event_message(e).lower())]
+        display_rows = [{
+            "time": event.get("time"),
+            "status": self._event_status(event)[1],
+            "source": self._event_source_label(event.get("source")),
+            "message": self._event_message(event),
+        } for event in rows]
+        self._fill_table(self.tbl_events, display_rows, ["time", "status", "source", "message"])
         for row, event in enumerate(rows):
             is_error = str(event.get("level", "")).upper() == "ERROR"
-            self.tbl_events.item(row, 1).setText("Lỗi" if is_error else "Thông tin")
             if is_error:
                 for col in range(self.tbl_events.columnCount()):
                     self.tbl_events.item(row, col).setBackground(QColor("#fef2f2"))
                     self.tbl_events.item(row, col).setForeground(QColor("#991b1b"))
             for col in range(self.tbl_events.columnCount()):
-                self.tbl_events.item(row, col).setToolTip(str(event.get("message", "")))
+                self.tbl_events.item(row, col).setToolTip(self._event_message(event))
         self.lbl_event_count.setText(f"Hiển thị {len(rows)}/{len(self._history_events)} sự kiện")
+
+    @staticmethod
+    def _event_source_label(source) -> str:
+        return {
+            "edit": "Biên tập", "export": "Xuất bản",
+            "download": "Tải xuống", "scan": "Quét nguồn",
+        }.get(str(source or "khác").lower(), str(source or "Khác").capitalize())
+
+    @staticmethod
+    def _event_status(event: dict) -> tuple[str, str]:
+        message = str(event.get("message") or "").lower()
+        if str(event.get("level") or "").upper() == "ERROR" or " lỗi" in message:
+            return "error", "Lỗi"
+        if "bắt đầu" in message:
+            return "started", "Bắt đầu"
+        if any(word in message for word in ("kết thúc", "hoàn thành", "tải xong")):
+            return "completed", "Hoàn thành"
+        if any(word in message for word in ("đã dừng", "tạm dừng")):
+            return "stopped", "Đã dừng"
+        return "info", "Thông tin"
+
+    def _event_message(self, event: dict) -> str:
+        message = str(event.get("message") or "")
+        # Dữ liệu lịch sử cũ chỉ lưu ID; thay bằng tên khi video vẫn còn trong kho.
+        for video_id, title in sorted(
+                getattr(self, "_history_video_titles", {}).items(),
+                key=lambda pair: len(pair[0]), reverse=True):
+            if title and video_id in message:
+                message = message.replace(video_id, title)
+        return message
 
     def _show_event_detail(self, row: int, _col: int) -> None:
         level = self.tbl_events.item(row, 1).text() if self.tbl_events.item(row, 1) else ""
@@ -1423,7 +1719,7 @@ class MainWindow(QMainWindow):
 
     def _open_export_dir(self, row: int, col: int) -> None:
         """Bấm đúp 1 dòng -> mở thư mục xuất bản (<kênh>/<id>) trong Explorer."""
-        item = self.tbl_exports.item(row, 3)  # cột "Thư mục"
+        item = self.tbl_exports.item(row, 4)  # cột "Thư mục"
         path = (item.toolTip() or item.text()) if item else ""
         if path and os.path.isdir(path):
             try:
@@ -1733,6 +2029,8 @@ class MainWindow(QMainWindow):
         if text not in self._ASPECTS:
             return
         self.cfg.editor.target_aspect = text
+        self._refresh_mask_list()
+        self._sync_masks_to_preview()
         self.lbl_edit_summary.setText(self._edit_summary())
         self._mark_settings_dirty()
         self._log_ed(f"Khung hình đầu ra: {text} — đang chờ lưu.")
@@ -2039,6 +2337,17 @@ class MainWindow(QMainWindow):
             lambda on: self._set_cfg(s, "burn_in", bool(on), "Ghi phụ đề lên video"))
         form.addRow("Bật phụ đề", self.chk_sub)
 
+        self.chk_sub_replacement_box = QCheckBox(
+            "Dùng chung khung che phụ đề cũ (khuyên dùng)")
+        self.chk_sub_replacement_box.setChecked(
+            bool(getattr(s, "replacement_box_enabled", False)))
+        self.chk_sub_replacement_box.setToolTip(
+            "Nền che phụ đề cũ và chữ phụ đề mới dùng chung một khung. "
+            "Nền được vẽ trước, chữ được vẽ sau nên màu chữ không bị che.")
+        self.chk_sub_replacement_box.toggled.connect(
+            self._set_subtitle_replacement_box)
+        form.addRow("Khung phụ đề thay thế", self.chk_sub_replacement_box)
+
         self.cmb_tr = self._data_combo(self._SUB_LANGS, s.translate_to)
         self._bind_combo(self.cmb_tr, s, "translate_to", "Dịch sang")
         form.addRow("Dịch sang (chỉ hiển thị bản dịch)", self.cmb_tr)
@@ -2132,6 +2441,7 @@ class MainWindow(QMainWindow):
         form.addRow("Khung an toàn phụ đề", margins)
 
         children = (
+            self.chk_sub_replacement_box,
             self.cmb_tr, self.cmb_subpos, self.sp_subsize,
             self.sub_font_color, self.sub_background_color,
             self.sp_sub_background_opacity, margins)
@@ -2144,7 +2454,72 @@ class MainWindow(QMainWindow):
         # 'Dịch sang', nên đồng bộ lại khi bật/tắt phụ đề hoặc đổi ngôn ngữ dịch.
         self.chk_sub.toggled.connect(lambda _on: self._sync_voiceover_controls())
         self.cmb_tr.currentIndexChanged.connect(lambda _i: self._filter_edge_voices())
+        if self.chk_sub_replacement_box.isChecked():
+            self._ensure_subtitle_replacement_mask()
         return g
+
+    def _ensure_subtitle_replacement_mask(self) -> int:
+        """Return/create the mask that is also the new subtitle container."""
+        subtitle = self.cfg.editor.subtitle
+        for index, mask in enumerate(self.cfg.editor.mask_regions):
+            if mask.purpose == "old_subtitle":
+                mask.timing_mode = "subtitle"
+                mask.mode = "solid"
+                mask.color = subtitle.background_color
+                mask.opacity = subtitle.background_opacity
+                mask.visible = True
+                mask.linked_to_subtitle = True
+                mask.subtitle_pad_before = 0.0
+                mask.subtitle_pad_after = 0.0
+                return index
+        self.cfg.editor.mask_regions.append(MaskRegionCfg(
+            name="Khung phụ đề thay thế", purpose="old_subtitle",
+            mode="solid", x=.08, y=.76, width=.84, height=.14,
+            color=subtitle.background_color,
+            opacity=subtitle.background_opacity, timing_mode="subtitle",
+            subtitle_pad_before=0.0, subtitle_pad_after=0.0,
+            linked_to_subtitle=True))
+        return len(self.cfg.editor.mask_regions) - 1
+
+    def _set_subtitle_replacement_box(self, enabled: bool) -> None:
+        subtitle = self.cfg.editor.subtitle
+        self._set_cfg(subtitle, "replacement_box_enabled", bool(enabled),
+                      "Khung phụ đề thay thế")
+        if enabled:
+            active = self._ensure_subtitle_replacement_mask()
+            if hasattr(self, "cmb_preview_mode"):
+                self._set_combo_data(self.cmb_preview_mode, "edit")
+                self._on_preview_mode_changed()
+            if hasattr(self, "lbl_live_preview"):
+                self._sync_masks_to_preview(active)
+            if hasattr(self, "cmb_preview_target"):
+                target = self.cmb_preview_target.findData("mask")
+                if target >= 0:
+                    self.cmb_preview_target.setCurrentIndex(target)
+            if hasattr(self, "lbl_live_preview"):
+                self._sync_masks_to_preview(active)
+            if hasattr(self, "lbl_preview_context"):
+                self.lbl_preview_context.setText("Khung phụ đề thay thế")
+        else:
+            for mask in self.cfg.editor.mask_regions:
+                if getattr(mask, "linked_to_subtitle", False):
+                    mask.visible = False
+            if hasattr(self, "cmb_preview_target"):
+                target = self.cmb_preview_target.findData("subtitle")
+                if target >= 0:
+                    self.cmb_preview_target.setCurrentIndex(target)
+            if hasattr(self, "cmb_preview_mode"):
+                self._set_combo_data(self.cmb_preview_mode, "result")
+                self._on_preview_mode_changed()
+        self._mark_preview_stale("subtitle")
+        if enabled and hasattr(self, "cmb_preview_target"):
+            target = self.cmb_preview_target.findData("mask")
+            if target >= 0:
+                self.cmb_preview_target.setCurrentIndex(target)
+            self._sync_masks_to_preview(active)
+            self.lbl_preview_position.setText(
+                "Kéo khung để di chuyển; kéo bốn góc để đổi kích thước · chưa lưu")
+        self._mark_settings_dirty()
 
     def _tts_effective_language(self) -> str:
         # Ngôn ngữ lồng tiếng độc lập với ngôn ngữ phụ đề.
@@ -2490,9 +2865,7 @@ class MainWindow(QMainWindow):
         self._add_text_overlay_rows(cta_form, e.outro_cta, "CTA cuối video", "cta")
         tabs.addTab(cta_page, "CTA cuối video")
         self.brand_tabs = tabs
-        tabs.currentChanged.connect(
-            lambda i: self.cmb_preview_target.setCurrentIndex(i)
-            if hasattr(self, "cmb_preview_target") else None)
+        tabs.currentChanged.connect(self._on_brand_tab_changed)
         self._refresh_overlay_warnings()
         return tabs
 
@@ -2542,10 +2915,13 @@ class MainWindow(QMainWindow):
         self._bind_combo(self.cmb_fill, e, "fill_missing", "Bố cục đầu ra")
         form.addRow("Bố cục đầu ra", self.cmb_fill)
         crop_hint = QLabel(
-            "Nguồn ngang/1:1: cắt trái-phải, phóng nội dung giữa và lấp trên-dưới bằng "
-            "nền mờ. Nguồn đã là 9:16: cắt đều cả 4 cạnh rồi phóng đầy khung, không "
-            "thêm nền mờ. Preview và video xuất dùng cùng một bố cục.")
-        crop_hint.setWordWrap(True); crop_hint.setStyleSheet("color:#64748b;")
+            "16:9: co ngang theo %, cắt 2 bên rồi phóng; nền mờ lấp phần trên/dưới. "
+            "1:1: cắt/phóng và dùng nền mờ. 9:16: cắt đều 4 cạnh, không thêm nền mờ. "
+            "Preview giống video xuất.")
+        crop_hint.setWordWrap(True)
+        crop_hint.setContentsMargins(0, 0, 0, 0)
+        crop_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        crop_hint.setStyleSheet("color:#64748b;")
         form.addRow("", crop_hint)
         self.chk_flip = QCheckBox("Lật hình theo chiều ngang")
         self.chk_flip.setChecked(e.flip_horizontal)
@@ -2579,7 +2955,7 @@ class MainWindow(QMainWindow):
             "CHỈ áp dụng cho video ĐÚNG 16:9: nén bớt chiều rộng TRƯỚC khi cắt 2 bên "
             "-> giữ nhiều nội dung hai bên hơn khi về 9:16 (đổi lại hình hơi thon).")
         self._bind_int(self.sp_squeeze, e, "side_squeeze_percent", "Co ngang")
-        form.addRow("Co ngang (video 16:9)", self.sp_squeeze)
+        form.addRow("Co ngang trước cắt (16:9)", self.sp_squeeze)
         self.sp_sidecrop.setEnabled(e.fill_missing == "blur")
         self.cmb_fill.currentIndexChanged.connect(
             lambda _i: self.sp_sidecrop.setEnabled(self.cmb_fill.currentData() == "blur"))
@@ -2601,7 +2977,444 @@ class MainWindow(QMainWindow):
             widget.setEnabled(cg.enabled)
         self.chk_color.toggled.connect(
             lambda on: [widget.setEnabled(on) for widget in color_children])
+
+        mask_box = QGroupBox("Các vùng che")
+        mask_layout = QVBoxLayout(mask_box)
+        hint = QLabel(
+            "Che phụ đề, logo, chữ hoặc thông tin đã có trong video. Thêm một vùng, "
+            "sau đó kéo hoặc thay đổi kích thước trực tiếp trên preview.")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#64748b;")
+        mask_layout.addWidget(hint)
+        # Bốn tác vụ phổ biến luôn nhìn thấy, không giấu trong một dropdown.
+        self.cmb_mask_preset = self._data_combo([
+            ("old_subtitle", "Phụ đề cũ · khung ngang sát đáy"),
+            ("old_logo", "Logo/watermark cũ · khung góc"),
+            ("privacy", "Thông tin riêng tư · pixel hóa"),
+            ("custom", "Vùng tùy chỉnh"),
+        ], "old_subtitle")
+        self.cmb_mask_preset.hide()
+        preset_grid = QGridLayout(); preset_grid.setSpacing(6)
+        for column, (label, preset) in enumerate((
+                ("+ Phụ đề cũ", "old_subtitle"),
+                ("+ Logo cũ", "old_logo"),
+                ("+ Che thông tin", "privacy"),
+                ("+ Vùng tùy chỉnh", "custom"))):
+            button = QPushButton(label)
+            button.setToolTip(f"Tạo nhanh vùng {label[2:].lower()} và chọn ngay trên preview.")
+            button.clicked.connect(
+                lambda _checked=False, value=preset: self._add_mask_preset(value))
+            preset_grid.addWidget(button, 0, column)
+        mask_layout.addLayout(preset_grid)
+        self.lst_masks = QListWidget(); self.lst_masks.setMaximumHeight(128)
+        self.lst_masks.currentRowChanged.connect(self._select_mask_region)
+        mask_layout.addWidget(self.lst_masks)
+        mask_actions = QHBoxLayout()
+        self.chk_mask_visible = QCheckBox("Hiển thị")
+        self.chk_mask_visible.toggled.connect(self._update_mask_controls)
+        mask_actions.addWidget(self.chk_mask_visible); mask_actions.addStretch(1)
+        self.chk_mask_locked = QCheckBox("Khóa vị trí")
+        self.chk_mask_locked.toggled.connect(self._update_mask_controls)
+        mask_actions.addWidget(self.chk_mask_locked)
+        mask_layout.addLayout(mask_actions)
+        mask_form = QFormLayout()
+        self.txt_mask_name = QLineEdit()
+        self.txt_mask_name.setPlaceholderText("Tên để nhận biết vùng che")
+        self.txt_mask_name.editingFinished.connect(self._rename_mask_region)
+        mask_form.addRow("Tên vùng", self.txt_mask_name)
+        self.cmb_mask_mode = self._data_combo([
+            ("blur", "Làm mờ"),
+            ("pixelate", "Pixel hóa"),
+            ("solid", "Phủ màu"),
+        ], "blur")
+        self.cmb_mask_mode.currentIndexChanged.connect(self._update_mask_controls)
+        mask_form.addRow("Kiểu che", self.cmb_mask_mode)
+        self.sp_mask_strength = self._spin(QSpinBox, 2, 40, 16)
+        self.sp_mask_strength.setToolTip(
+            "Làm mờ: bán kính làm mờ. Pixel hóa: kích thước ô. Mức 8–20 thường tự nhiên.")
+        self.sp_mask_strength.valueChanged.connect(self._update_mask_controls)
+        self.lbl_mask_strength = QLabel("Mức làm mờ")
+        mask_form.addRow(self.lbl_mask_strength, self.sp_mask_strength)
+        self.sp_mask_opacity = self._spin(QSpinBox, 10, 100, 80, 5)
+        self.sp_mask_opacity.setSuffix("%")
+        self.sp_mask_opacity.valueChanged.connect(self._update_mask_controls)
+        self.lbl_mask_opacity = QLabel("Độ đậm")
+        mask_form.addRow(self.lbl_mask_opacity, self.sp_mask_opacity)
+        self.cmb_mask_color = self._data_combo([
+            ("#000000", "Đen"), ("#111827", "Xanh đen"),
+            ("#FFFFFF", "Trắng"), ("#374151", "Xám đậm"),
+            ("#78350F", "Nâu đậm"), ("#1E3A8A", "Xanh đậm"),
+        ], "#000000")
+        self.cmb_mask_color.currentIndexChanged.connect(self._update_mask_controls)
+        self.lbl_mask_color = QLabel("Màu phủ")
+        mask_form.addRow(self.lbl_mask_color, self.cmb_mask_color)
+        self.cmb_mask_timing = self._data_combo([
+            ("subtitle", "Khi có phụ đề mới (khuyên dùng)"),
+            ("full", "Toàn bộ video"),
+            ("custom", "Khoảng thời gian tùy chỉnh"),
+        ], "full")
+        self.cmb_mask_timing.currentIndexChanged.connect(self._toggle_mask_time_range)
+        mask_form.addRow("Thời điểm che", self.cmb_mask_timing)
+        self.mask_subtitle_padding_widget = QWidget()
+        padding_row = QHBoxLayout(self.mask_subtitle_padding_widget)
+        padding_row.setContentsMargins(0, 0, 0, 0); padding_row.setSpacing(6)
+        self.sp_mask_pad_before = self._spin(QDoubleSpinBox, 0, 2, .10, .05)
+        self.sp_mask_pad_after = self._spin(QDoubleSpinBox, 0, 2, .15, .05)
+        self.sp_mask_pad_before.setSuffix(" s"); self.sp_mask_pad_after.setSuffix(" s")
+        self.sp_mask_pad_before.valueChanged.connect(self._update_mask_controls)
+        self.sp_mask_pad_after.valueChanged.connect(self._update_mask_controls)
+        padding_row.addWidget(QLabel("Trước")); padding_row.addWidget(self.sp_mask_pad_before)
+        padding_row.addWidget(QLabel("Sau")); padding_row.addWidget(self.sp_mask_pad_after)
+        mask_form.addRow("Đệm thời gian", self.mask_subtitle_padding_widget)
+        self.mask_time_widget = QWidget()
+        time_row = QHBoxLayout()
+        time_row.setContentsMargins(0, 0, 0, 0)
+        self.sp_mask_start = self._spin(QDoubleSpinBox, 0, 86400, 0, .5)
+        self.sp_mask_end = self._spin(QDoubleSpinBox, 0, 86400, 0, .5)
+        self.sp_mask_start.setSuffix(" s"); self.sp_mask_end.setSuffix(" s")
+        self.sp_mask_start.valueChanged.connect(self._update_mask_controls)
+        self.sp_mask_end.valueChanged.connect(self._update_mask_controls)
+        time_row.addWidget(QLabel("Từ")); time_row.addWidget(self.sp_mask_start)
+        time_row.addWidget(QLabel("đến")); time_row.addWidget(self.sp_mask_end)
+        self.mask_time_widget.setLayout(time_row)
+        mask_form.addRow("Thời gian", self.mask_time_widget)
+        self.lbl_mask_time_hint = QLabel("Mặc định áp dụng toàn bộ video.")
+        self.lbl_mask_time_hint.setStyleSheet("color:#64748b;")
+        mask_form.addRow("", self.lbl_mask_time_hint)
+        self.cmb_mask_shape = self._data_combo([
+            ("rectangle", "Chữ nhật tự do"), ("square", "Hình vuông"),
+        ], "rectangle")
+        self.cmb_mask_shape.currentIndexChanged.connect(self._update_mask_controls)
+        mask_form.addRow("Hình dạng nâng cao", self.cmb_mask_shape)
+        mask_layout.addLayout(mask_form)
+        # Không chèn vào trang Hình ảnh. Trang thiết lập chính sẽ đặt widget này
+        # thành một mục điều hướng độc lập ngay dưới "Thương hiệu".
+        self.mask_settings_widget = mask_box
+        self._refresh_mask_list()
         return g
+
+    def _refresh_mask_list(self, selected: int | None = None) -> None:
+        if not hasattr(self, "lst_masks"):
+            return
+        if selected is None:
+            selected = self.lst_masks.currentRow()
+        self.lst_masks.blockSignals(True); self.lst_masks.clear()
+        modes = {"blur":"Làm mờ", "pixelate":"Vỡ hạt", "solid":"Phủ nền"}
+        for index, mask in enumerate(self.cfg.editor.mask_regions):
+            state = ("" if mask.visible else " · đang ẩn") + (" · đã khóa" if mask.locked else "")
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, 28))
+            self.lst_masks.addItem(item)
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(6, 1, 3, 1)
+            row_layout.setSpacing(4)
+            select_button = QPushButton(
+                f"{index + 1}. {mask.name} · {modes.get(mask.mode, mask.mode)}{state}")
+            select_button.setFlat(True)
+            select_button.setStyleSheet(
+                "QPushButton{text-align:left;border:0;background:transparent;padding:1px 2px;}"
+                "QPushButton:hover{color:#1d4ed8;}")
+            select_button.clicked.connect(
+                lambda _checked=False, current=item: self.lst_masks.setCurrentItem(current))
+            row_layout.addWidget(select_button, 1)
+            delete_button = QPushButton("×")
+            delete_button.setFixedSize(24, 22)
+            delete_button.setToolTip("Xóa vùng che này")
+            delete_button.setStyleSheet(
+                "QPushButton{border:0;background:transparent;color:#64748b;"
+                "font-size:17px;font-weight:600;padding:0;}"
+                "QPushButton:hover{background:#fee2e2;color:#b91c1c;border-radius:4px;}")
+            delete_button.clicked.connect(
+                lambda _checked=False, current=item: self._delete_mask_list_item(current))
+            row_layout.addWidget(delete_button)
+            self.lst_masks.setItemWidget(item, row)
+        if self.cfg.editor.mask_regions:
+            selected = max(0, min(int(selected or 0), len(self.cfg.editor.mask_regions)-1))
+            self.lst_masks.setCurrentRow(selected)
+        self.lst_masks.blockSignals(False)
+        self._select_mask_region(self.lst_masks.currentRow())
+
+    def _add_mask_region(self) -> None:
+        preset = self.cmb_mask_preset.currentData() or "custom"
+        values = {
+            "old_subtitle": dict(name="Phụ đề cũ", purpose=preset, mode="solid",
+                                 x=.08, y=.78, width=.84, height=.14, strength=16,
+                                 opacity=.80, timing_mode="subtitle",
+                                 subtitle_pad_before=.10, subtitle_pad_after=.15),
+            "old_logo": dict(name="Logo cũ", purpose=preset, mode="blur",
+                             x=.73, y=.04, width=.23, height=.10, strength=16),
+            "privacy": dict(name="Thông tin riêng tư", purpose=preset, mode="pixelate",
+                            x=.30, y=.38, width=.40, height=.18, strength=12),
+            "custom": dict(name="Vùng che tùy chỉnh", purpose=preset, mode="blur",
+                           x=.30, y=.35, width=.40, height=.20, strength=16),
+        }[preset]
+        self.cfg.editor.mask_regions.append(MaskRegionCfg(**values))
+        index = len(self.cfg.editor.mask_regions) - 1
+        self._refresh_mask_list(index)
+        self._mark_settings_dirty()
+        if hasattr(self, "cmb_preview_target"):
+            mask_item = self.cmb_preview_target.findData("mask")
+            if mask_item >= 0: self.cmb_preview_target.setCurrentIndex(mask_item)
+        self._sync_masks_to_preview(index)
+        # Một lần bấm phải cho thấy ngay kết quả. Nếu preview chưa có ảnh, tự lấy
+        # video đang xử lý/đang chọn thay vì bắt người dùng tìm thêm nút khác.
+        if (hasattr(self, "lbl_live_preview")
+                and self.lbl_live_preview._source.isNull()):
+            QTimer.singleShot(0, lambda: self.on_preview(batch=False))
+
+    def _add_mask_preset(self, preset: str) -> None:
+        """Tạo vùng từ nút tác vụ nhanh và dùng chung luồng thêm hiện tại."""
+        self._set_combo_data(self.cmb_mask_preset, preset)
+        self._add_mask_region()
+
+    def _duplicate_mask_region(self) -> None:
+        index = self.lst_masks.currentRow() if hasattr(self, "lst_masks") else -1
+        if not (0 <= index < len(self.cfg.editor.mask_regions)):
+            return
+        duplicate = deepcopy(self.cfg.editor.mask_regions[index])
+        duplicate.name = f"{duplicate.name} (bản sao)"
+        duplicate.x = min(max(0.0, 1.0 - duplicate.width), duplicate.x + .03)
+        duplicate.y = min(max(0.0, 1.0 - duplicate.height), duplicate.y + .03)
+        duplicate.locked = False
+        self.cfg.editor.mask_regions.insert(index + 1, duplicate)
+        self._refresh_mask_list(index + 1)
+        self._mark_settings_dirty(); self._sync_masks_to_preview(index + 1)
+
+    def _rename_mask_region(self) -> None:
+        index = self.lst_masks.currentRow() if hasattr(self, "lst_masks") else -1
+        if not (0 <= index < len(self.cfg.editor.mask_regions)):
+            return
+        name = self.txt_mask_name.text().strip()
+        if not name:
+            name = f"Vùng che {index + 1}"
+            self.txt_mask_name.setText(name)
+        if self.cfg.editor.mask_regions[index].name != name:
+            self.cfg.editor.mask_regions[index].name = name
+            self._mark_settings_dirty(); self._refresh_mask_list(index)
+            self._sync_masks_to_preview(index)
+
+    def _toggle_mask_time_range(self, _index: int = 0) -> None:
+        timing = (self.cmb_mask_timing.currentData()
+                  if hasattr(self, "cmb_mask_timing") else "full")
+        custom = timing == "custom"
+        if hasattr(self, "mask_time_widget"):
+            self.mask_time_widget.setVisible(custom)
+            self.mask_time_widget.setEnabled(custom)
+        if hasattr(self, "mask_subtitle_padding_widget"):
+            self.mask_subtitle_padding_widget.setVisible(timing == "subtitle")
+        if hasattr(self, "lbl_mask_time_hint"):
+            hints = {
+                "subtitle": "Chỉ che theo từng câu SRT/ASS mới; phụ đề mới nằm phía trên.",
+                "custom": "Nhập thời điểm bắt đầu và kết thúc.",
+                "full": "Vùng che xuất hiện xuyên suốt video.",
+            }
+            self.lbl_mask_time_hint.setText(hints.get(timing, hints["full"]))
+        if custom and self.sp_mask_end.value() <= self.sp_mask_start.value():
+            self.sp_mask_end.setValue(self.sp_mask_start.value() + 5.0)
+        self._update_mask_controls()
+
+    def _delete_mask_region(self) -> None:
+        index = self.lst_masks.currentRow() if hasattr(self, "lst_masks") else -1
+        self._delete_mask_at(index)
+
+    def _delete_mask_list_item(self, item: QListWidgetItem) -> None:
+        """Xóa đúng vùng từ nút × của từng dòng, không phụ thuộc dòng đang chọn."""
+        index = self.lst_masks.row(item) if hasattr(self, "lst_masks") else -1
+        self._delete_mask_at(index)
+
+    def _delete_mask_at(self, index: int) -> None:
+        if 0 <= index < len(self.cfg.editor.mask_regions):
+            linked_subtitle = bool(getattr(
+                self.cfg.editor.mask_regions[index], "linked_to_subtitle", False))
+            del self.cfg.editor.mask_regions[index]
+            if linked_subtitle:
+                self.cfg.editor.subtitle.replacement_box_enabled = False
+                if hasattr(self, "chk_sub_replacement_box"):
+                    self.chk_sub_replacement_box.blockSignals(True)
+                    self.chk_sub_replacement_box.setChecked(False)
+                    self.chk_sub_replacement_box.blockSignals(False)
+            self._refresh_mask_list(min(index, len(self.cfg.editor.mask_regions)-1))
+            self._mark_settings_dirty(); self._sync_masks_to_preview()
+
+    def _select_mask_region(self, index: int) -> None:
+        enabled = 0 <= index < len(self.cfg.editor.mask_regions)
+        for name in ("txt_mask_name", "cmb_mask_mode", "cmb_mask_shape", "sp_mask_strength",
+                     "sp_mask_opacity", "cmb_mask_color", "cmb_mask_timing",
+                     "sp_mask_pad_before", "sp_mask_pad_after",
+                     "sp_mask_start", "sp_mask_end", "chk_mask_visible", "chk_mask_locked"):
+            if hasattr(self, name): getattr(self, name).setEnabled(enabled)
+        if not enabled:
+            self._sync_masks_to_preview(); return
+        if hasattr(self, "cmb_preview_target"):
+            mask_target = self.cmb_preview_target.findData("mask")
+            if mask_target >= 0 and self.cmb_preview_target.currentData() != "mask":
+                self.cmb_preview_target.setCurrentIndex(mask_target)
+        mask = self.cfg.editor.mask_regions[index]
+        controls = (self.txt_mask_name, self.cmb_mask_mode, self.cmb_mask_shape,
+                    self.sp_mask_strength, self.sp_mask_opacity, self.cmb_mask_color,
+                    self.cmb_mask_timing, self.sp_mask_pad_before, self.sp_mask_pad_after,
+                    self.sp_mask_start, self.sp_mask_end, self.chk_mask_visible,
+                    self.chk_mask_locked)
+        for control in controls: control.blockSignals(True)
+        self.txt_mask_name.setText(mask.name)
+        self._set_combo_data(self.cmb_mask_mode, mask.mode)
+        self._set_combo_data(self.cmb_mask_shape, mask.shape)
+        self.sp_mask_strength.setValue(mask.strength)
+        self.sp_mask_opacity.setValue(round(mask.opacity * 100))
+        self._set_combo_data(self.cmb_mask_color, mask.color)
+        self._set_combo_data(self.cmb_mask_timing, getattr(mask, "timing_mode", "full"))
+        self.sp_mask_pad_before.setValue(
+            float(getattr(mask, "subtitle_pad_before", .10)))
+        self.sp_mask_pad_after.setValue(
+            float(getattr(mask, "subtitle_pad_after", .15)))
+        self.sp_mask_start.setValue(mask.start_seconds); self.sp_mask_end.setValue(mask.end_seconds)
+        self.chk_mask_visible.setChecked(mask.visible)
+        self.chk_mask_locked.setChecked(mask.locked)
+        for control in controls: control.blockSignals(False)
+        self._refresh_mask_context_controls(
+            mask.mode, getattr(mask, "timing_mode", "full"))
+        self._sync_masks_to_preview(index)
+
+    def _update_mask_controls(self, *_args) -> None:
+        if not hasattr(self, "lst_masks"):
+            return
+        index = self.lst_masks.currentRow()
+        if not (0 <= index < len(self.cfg.editor.mask_regions)):
+            return
+        mask = self.cfg.editor.mask_regions[index]
+        mask.mode = self.cmb_mask_mode.currentData() or "blur"
+        mask.shape = self.cmb_mask_shape.currentData() or "rectangle"
+        mask.strength = self.sp_mask_strength.value()
+        mask.opacity = self.sp_mask_opacity.value() / 100.0
+        mask.color = self.cmb_mask_color.currentData() or "#000000"
+        timing = self.cmb_mask_timing.currentData() or "full"
+        mask.timing_mode = timing
+        mask.subtitle_pad_before = self.sp_mask_pad_before.value()
+        mask.subtitle_pad_after = self.sp_mask_pad_after.value()
+        mask.start_seconds = self.sp_mask_start.value() if timing == "custom" else 0.0
+        mask.end_seconds = self.sp_mask_end.value() if timing == "custom" else 0.0
+        mask.visible = self.chk_mask_visible.isChecked()
+        mask.locked = self.chk_mask_locked.isChecked()
+        if mask.shape == "square":
+            aw, ah = (float(v) for v in self.cfg.editor.target_aspect.split(":"))
+            mask.height = min(1.0 - mask.y, mask.width * aw / ah)
+        self._refresh_mask_context_controls(mask.mode, timing)
+        self._mark_settings_dirty(); self._refresh_mask_list(index)
+        self._sync_masks_to_preview(index)
+
+    def _refresh_mask_context_controls(self, mode: str, timing: str) -> None:
+        solid = mode == "solid"
+        pixel = mode == "pixelate"
+        self.sp_mask_opacity.setVisible(solid)
+        self.lbl_mask_opacity.setVisible(solid)
+        self.cmb_mask_color.setVisible(solid)
+        self.lbl_mask_color.setVisible(solid)
+        self.sp_mask_strength.setVisible(not solid)
+        self.lbl_mask_strength.setVisible(not solid)
+        if not solid:
+            self.lbl_mask_strength.setText("Kích thước hạt" if pixel else "Mức làm mờ")
+        custom = timing == "custom"
+        self.mask_time_widget.setVisible(custom)
+        self.mask_time_widget.setEnabled(custom)
+        self.mask_subtitle_padding_widget.setVisible(timing == "subtitle")
+        hints = {
+            "subtitle": "Chỉ che theo từng câu SRT/ASS mới; phụ đề mới nằm phía trên.",
+            "custom": "Nhập thời điểm bắt đầu và kết thúc.",
+            "full": "Vùng che xuất hiện xuyên suốt video.",
+        }
+        self.lbl_mask_time_hint.setText(hints.get(timing, hints["full"]))
+
+    def _sync_masks_to_preview(self, active: int = -1) -> None:
+        if hasattr(self, "lbl_live_preview"):
+            self.lbl_live_preview.set_masks(self.cfg.editor.mask_regions, active)
+            page = getattr(self, "_editor_settings_page_index", 0)
+            if page == 5:
+                allowed = None
+            elif page == 3 and getattr(
+                    self.cfg.editor.subtitle, "replacement_box_enabled", False):
+                allowed = {
+                    index for index, mask in enumerate(self.cfg.editor.mask_regions)
+                    if getattr(mask, "linked_to_subtitle", False)
+                    and getattr(mask, "visible", True)}
+            else:
+                allowed = set()
+            self.lbl_live_preview.set_mask_context(allowed)
+
+    def _on_preview_mode_changed(self, _index: int = 0) -> None:
+        if not hasattr(self, "lbl_live_preview"):
+            return
+        editing = (hasattr(self, "cmb_preview_mode")
+                   and self.cmb_preview_mode.currentData() == "edit")
+        self.lbl_live_preview.set_edit_chrome(editing)
+        page = getattr(self, "_editor_settings_page_index", 0)
+        active = -1
+        if editing and page == 3 and getattr(
+                self.cfg.editor.subtitle, "replacement_box_enabled", False):
+            active = self._ensure_subtitle_replacement_mask()
+        elif editing and page == 5 and hasattr(self, "lst_masks"):
+            active = self.lst_masks.currentRow()
+        self._sync_masks_to_preview(active)
+        if not editing:
+            self.lbl_preview_position.setText("Bản xem trước sạch · giống video đầu ra")
+        elif page == 3 and active >= 0:
+            self.lbl_live_preview.set_active_mask(active)
+            self.lbl_preview_position.setText(
+                "Kéo khung để di chuyển; kéo góc để đổi kích thước")
+        else:
+            self._on_preview_target_changed()
+
+    def _on_preview_mask_changed(self, index: int, x: float, y: float,
+                                 width: float, height: float) -> None:
+        if not (0 <= index < len(self.cfg.editor.mask_regions)):
+            return
+        mask = self.cfg.editor.mask_regions[index]
+        if mask.shape == "square":
+            aw, ah = (float(v) for v in self.cfg.editor.target_aspect.split(":"))
+            height = min(1.0 - y, width * aw / ah)
+        mask.x, mask.y, mask.width, mask.height = x, y, width, height
+        self._sync_masks_to_preview(index)
+        self._mark_settings_dirty()
+        if hasattr(self, "lbl_preview_position"):
+            self.lbl_preview_position.setText(
+                f"{mask.name}: x {x:.0%}, y {y:.0%}, rộng {width:.0%}, cao {height:.0%} · đang cập nhật")
+
+    def _on_preview_mask_edit_finished(self, index: int) -> None:
+        """Thả chuột = tự lưu tọa độ và dựng lại preview, không cần nút Áp dụng."""
+        if not self.config_path:
+            return
+        try:
+            # Chỉ đưa danh sách vùng che vào cấu hình đã lưu. Những mục khác trong
+            # tab Cài đặt vẫn giữ nguyên cơ chế bấm "Lưu cài đặt".
+            self._saved_editor.mask_regions = deepcopy(self.cfg.editor.mask_regions)
+            self._queue_tab.cfg.editor.mask_regions = deepcopy(
+                self.cfg.editor.mask_regions)
+            other_dirty = self.cfg.editor != self._saved_editor
+            snapshot = deepcopy(self.cfg)
+            snapshot.editor = deepcopy(self._saved_editor)
+            save_config(snapshot, self.config_path)
+            self._settings_dirty = other_dirty
+            if other_dirty:
+                self.lbl_edit_save_status.setText("● Cài đặt khác chưa lưu")
+                self.lbl_edit_save_status.setStyleSheet("color:#b45309;")
+            else:
+                self.lbl_edit_save_status.setText("✓ Vùng che đã tự lưu")
+                self.lbl_edit_save_status.setStyleSheet("color:#15803d;")
+            if 0 <= index < len(self.cfg.editor.mask_regions):
+                name = self.cfg.editor.mask_regions[index].name
+                self.lbl_preview_position.setText(
+                    f"{name} · đã tự lưu vị trí và kích thước")
+            # Dựng lại hiệu ứng thật sau khi thả chuột; trong lúc kéo khung vẫn
+            # chuyển động tức thời nên giao diện không bị giật ở từng pixel.
+            QTimer.singleShot(150, lambda: self.on_preview(batch=False))
+        except Exception as ex:
+            self._settings_dirty = True
+            self.lbl_edit_save_status.setText("● Chưa lưu được vùng che")
+            self.lbl_edit_save_status.setStyleSheet("color:#b91c1c;")
+            QMessageBox.warning(self, "Không thể tự lưu vùng che", str(ex))
+
+    def _on_preview_mask_selected(self, index: int) -> None:
+        if hasattr(self, "lst_masks"):
+            self.lst_masks.setCurrentRow(index)
 
     def _build_audio_settings_group(self) -> QWidget:
         e, a = self.cfg.editor, self.cfg.editor.audio
@@ -2914,6 +3727,7 @@ class MainWindow(QMainWindow):
         e.color_grading.brightness = d.color_grading.brightness
         e.color_grading.contrast = d.color_grading.contrast
         e.color_grading.saturation = d.color_grading.saturation
+        e.mask_regions = []
         e.audio.mute_all = d.audio.mute_all
         e.audio.separate_speech = d.audio.separate_speech
         e.audio.pitch_shift_semitones = d.audio.pitch_shift_semitones
@@ -2975,6 +3789,8 @@ class MainWindow(QMainWindow):
         self._sync_audio_mode_combo()      # ô 'Âm thanh đầu ra' về mặc định (giữ nguyên gốc)
         self._sync_voiceover_controls()    # ô 'Lồng tiếng' theo config sau khi reset voiceover
 
+        self._refresh_mask_list()
+        self._sync_masks_to_preview()
         self.lbl_edit_summary.setText(self._edit_summary())
         self._mark_settings_dirty()
         self._log_ed("Đã khôi phục cài đặt nâng cao về bản nháp mặc định; chưa lưu.")
@@ -3055,10 +3871,12 @@ class MainWindow(QMainWindow):
         out_dir = str(Path(self.cfg.editor.output_dir) / "_previews")
         target = (self.cmb_preview_target.currentData()
                   if hasattr(self, "cmb_preview_target") else "logo")
+        at_seconds = (self.sp_preview_time.value()
+                      if hasattr(self, "sp_preview_time") else 1.0)
         try:
             if batch:
                 res = preview.preview_batch(
-                    self.cfg, vids, out_dir, at_seconds=1.0, overlay_target=target,
+                    self.cfg, vids, out_dir, at_seconds=at_seconds, overlay_target=target,
                     video_ids=video_ids)
                 ok = sum(r["ok"] for r in res)
                 self._log_ed(f"Xem trước hàng loạt: {ok}/{len(res)} ảnh -> {out_dir}")
@@ -3068,7 +3886,7 @@ class MainWindow(QMainWindow):
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
                 png = str(Path(out_dir) / "preview.png")
                 preview.preview_frame(
-                    self.cfg, vids[0], png, at_seconds=1.0, overlay_target=target,
+                    self.cfg, vids[0], png, at_seconds=at_seconds, overlay_target=target,
                     video_id=video_ids[0])
                 self._log_ed(f"Xem trước: {png}")
                 if hasattr(self, "lbl_live_preview"):
@@ -3081,7 +3899,13 @@ class MainWindow(QMainWindow):
 
     def _on_inline_position_click(self, fx: float, fy: float) -> None:
         """Đặt Logo/Hook/CTA trực tiếp trên preview, không mở modal riêng."""
+        # Chỉ các trang Phụ đề/Thương hiệu mới dùng click để đặt lớp mới.
+        # Trang Che nội dung cũ có luồng kéo/thay đổi kích thước riêng.
+        if getattr(self, "_editor_settings_page_index", 0) not in (3, 4):
+            return
         target = self.cmb_preview_target.currentData()
+        if target == "mask":
+            return
         if hasattr(self, "brand_tabs") and target in ("logo", "hook", "cta"):
             wanted = {"logo": 0, "hook": 1, "cta": 2}.get(target, 0)
             if self.brand_tabs.currentIndex() != wanted:
@@ -3136,6 +3960,15 @@ class MainWindow(QMainWindow):
             return
         target = self.cmb_preview_target.currentData()
         e = self.cfg.editor
+        if target == "mask":
+            active = self.lst_masks.currentRow() if hasattr(self, "lst_masks") else -1
+            self._sync_masks_to_preview(active)
+            self.lbl_live_preview.set_active_mask(active)
+            self.lbl_live_preview.set_safe_margins(0, 0, 0, 0)
+            state = "chưa lưu" if self._settings_dirty else "đã lưu"
+            self.lbl_preview_position.setText(
+                f"Kéo trong khung để di chuyển; kéo bốn góc để đổi kích thước · {state}")
+            return
         pos = (
             e.subtitle.position if target == "subtitle" else
             e.overlay.position if target == "logo" else
@@ -3161,6 +3994,75 @@ class MainWindow(QMainWindow):
                   "blur_bottom": "Vùng mờ phía dưới"}
         state = "chưa lưu" if self._settings_dirty else "đã lưu"
         self.lbl_preview_position.setText(f"{labels.get(pos, pos)} · {state}")
+
+    def _on_editor_settings_page_changed(self, index: int,
+                                         stack: QStackedWidget) -> None:
+        """Giữ preview tập trung vào đúng công cụ của trang đang mở."""
+        stack.setCurrentIndex(index)
+        self._editor_settings_page_index = index
+        mask_page = index == 5
+        if hasattr(self, "preview_box"):
+            self.preview_box.setTitle(
+                "Xem trước · Che nội dung cũ" if mask_page else "Xem trước")
+        target = None
+        if index == 3:
+            if getattr(self.cfg.editor.subtitle, "replacement_box_enabled", False):
+                target = "mask"
+                active = self._ensure_subtitle_replacement_mask()
+                self._sync_masks_to_preview(active)
+            else:
+                target = "subtitle"
+        elif index == 4:
+            brand_index = self.brand_tabs.currentIndex() if hasattr(self, "brand_tabs") else 0
+            target = {0: "logo", 1: "hook", 2: "cta"}.get(brand_index, "logo")
+        elif mask_page:
+            target = "mask"
+
+        show_position = target is not None
+        if hasattr(self, "lbl_preview_target"):
+            self.lbl_preview_target.hide()
+        if hasattr(self, "lbl_preview_context"):
+            self.lbl_preview_context.hide()
+        if hasattr(self, "lbl_preview_position"):
+            self.lbl_preview_position.setVisible(show_position)
+        if target and hasattr(self, "cmb_preview_target"):
+            target_index = self.cmb_preview_target.findData(target)
+            if target_index >= 0:
+                self.cmb_preview_target.setCurrentIndex(target_index)
+            self._update_preview_context_label(target)
+            if index == 3 and target == "mask":
+                self.lbl_preview_context.setText("Khung phụ đề thay thế")
+                self._sync_masks_to_preview(self._ensure_subtitle_replacement_mask())
+        if mask_page:
+            active = (self.lst_masks.currentRow()
+                      if hasattr(self, "lst_masks") else -1)
+            self._sync_masks_to_preview(active)
+        else:
+            self._sync_masks_to_preview()
+        if hasattr(self, "btn_preview_refresh"):
+            self.btn_preview_refresh.setText(
+                "Cập nhật xem trước" if mask_page else "Xem trước bản nháp")
+
+        self._on_preview_mode_changed()
+
+    def _update_preview_context_label(self, target: str) -> None:
+        if hasattr(self, "lbl_preview_context"):
+            self.lbl_preview_context.setText({
+                "subtitle": "Phụ đề", "logo": "Logo",
+                "hook": "Hook mở đầu", "cta": "CTA cuối video",
+                "mask": "Vùng che đang chọn",
+            }.get(target, target))
+
+    def _on_brand_tab_changed(self, index: int) -> None:
+        """Đồng bộ đúng tab thương hiệu với lớp đang chỉnh trên preview."""
+        if getattr(self, "_editor_settings_page_index", -1) != 4:
+            return
+        target = {0: "logo", 1: "hook", 2: "cta"}.get(index, "logo")
+        if hasattr(self, "cmb_preview_target"):
+            target_index = self.cmb_preview_target.findData(target)
+            if target_index >= 0:
+                self.cmb_preview_target.setCurrentIndex(target_index)
+        self._update_preview_context_label(target)
 
     def _sync_overlay_safe_frame(self, target: str) -> None:
         if (not hasattr(self, "cmb_preview_target")
@@ -3521,8 +4423,16 @@ class MainWindow(QMainWindow):
             else:
                 action = QPushButton("Đang dừng…")
                 action.setEnabled(False)
-            action.setMaximumWidth(92)
-            self.table.setCellWidget(i, 5, action)
+            action.setFixedSize(96, 30)
+            action.setStyleSheet(
+                action.styleSheet()
+                + "min-height:0px;max-height:30px;padding:1px 8px;")
+            action_host = QWidget()
+            action_layout = QHBoxLayout(action_host)
+            action_layout.setContentsMargins(4, 1, 4, 1)
+            action_layout.setAlignment(Qt.AlignCenter)
+            action_layout.addWidget(action)
+            self.table.setCellWidget(i, 5, action_host)
 
         counts = {"pending": 0, "downloading": 0, "cancelling": 0,
                   "paused": 0, "downloaded": 0, "failed": 0}

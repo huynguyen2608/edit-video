@@ -132,12 +132,15 @@ def test_export_and_event_log_persist(tmp_path):
     db.log_export("vE", "Kênh", "D:/out/Kênh/vE",
                   full_path="D:/out/Kênh/vE/vE_full.mp4",
                   short_path="D:/out/Kênh/vE/vE_short.mp4",
-                  content_txt="D:/out/Kênh/vE/vE_content.txt")
+                  content_txt="D:/out/Kênh/vE/vE_content.txt",
+                  video_title="Tên video E")
     # log_export tự thêm 1 event -> tổng 2 event
     assert len(db.recent_events()) == 2
     exp = db.recent_exports()
     assert len(exp) == 1 and exp[0]["video_id"] == "vE"
+    assert exp[0]["video_title"] == "Tên video E"
     assert exp[0]["full_path"].endswith("vE_full.mp4")
+    assert "Kết thúc xuất bản: Tên video E" in db.recent_events()[-1]["message"]
 
     # đọc lại từ đĩa: exports + events còn nguyên
     db2 = ExcelStore(path)

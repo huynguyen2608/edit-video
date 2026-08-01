@@ -51,6 +51,14 @@ class SQLiteStore(ExcelStore):
                     (table, c) in (("videos", "video_id"), ("channels", "channel_id")) else "")
                     for c in cols)
                 con.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({defs})')
+                existing = {
+                    str(row[1]) for row in
+                    con.execute(f'PRAGMA table_info("{table}")')
+                }
+                for column in cols:
+                    if column not in existing:
+                        con.execute(
+                            f'ALTER TABLE "{table}" ADD COLUMN "{column}" TEXT')
 
     def _load(self):
         with self._connect() as con:

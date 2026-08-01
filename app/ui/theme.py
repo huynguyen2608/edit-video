@@ -251,7 +251,9 @@ def make_columns_resizable(table, weights=None, min_width: int = 50) -> None:
     from PySide6.QtWidgets import QHeaderView
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.Interactive)   # kéo được
-    header.setStretchLastSection(False)
+    # Cột cuối luôn lấp đầy phần rộng còn lại. Các cột trước vẫn kéo được,
+    # nhưng không thể tạo một dải trống ở mép phải của bảng.
+    header.setStretchLastSection(True)
     header.setMinimumSectionSize(min_width)
     if weights:
         # Giữ tham chiếu trên chính table để không bị thu gom rác.

@@ -81,6 +81,30 @@ class PipCfg:
 
 
 @dataclass
+class MaskRegionCfg:
+    """Vùng che nội dung đã có, lưu theo tọa độ chuẩn hóa của KHUNG ĐẦU RA."""
+    name: str = "Vùng che"
+    purpose: str = "custom"       # custom | old_logo | old_subtitle | privacy
+    shape: str = "rectangle"      # rectangle | square
+    mode: str = "blur"            # blur | pixelate | solid
+    x: float = 0.70
+    y: float = 0.04
+    width: float = 0.25
+    height: float = 0.10
+    strength: int = 16             # blur radius hoặc kích thước ô pixel
+    color: str = "#000000"
+    opacity: float = 0.80
+    timing_mode: str = "full"      # full | subtitle | custom
+    subtitle_pad_before: float = 0.10
+    subtitle_pad_after: float = 0.15
+    start_seconds: float = 0.0
+    end_seconds: float = 0.0       # 0 = đến hết video
+    locked: bool = False
+    visible: bool = True
+    linked_to_subtitle: bool = False
+
+
+@dataclass
 class AudioCfg:
     separate_speech: bool = False
     # Bộ tách giọng: mdx (audio-separator, NHẸ, chạy CPU tốt, khuyên cho máy yếu) |
@@ -127,6 +151,7 @@ class SubtitleCfg:
     font_color: str = "#FFFFFF"
     background_color: str = "#000000"
     background_opacity: float = 0.55
+    replacement_box_enabled: bool = False
     margin_left_percent: int = 0
     margin_right_percent: int = 0
     margin_top_percent: int = 0
@@ -197,6 +222,7 @@ class EditorCfg:
     color_grading: ColorGradingCfg = field(default_factory=ColorGradingCfg)
     overlay: OverlayCfg = field(default_factory=OverlayCfg)
     picture_in_picture: PipCfg = field(default_factory=PipCfg)
+    mask_regions: list[MaskRegionCfg] = field(default_factory=list)
     audio: AudioCfg = field(default_factory=AudioCfg)
     subtitle: SubtitleCfg = field(default_factory=SubtitleCfg)
     tts: TtsCfg = field(default_factory=TtsCfg)
@@ -245,6 +271,24 @@ def _build(dc_type, data: dict[str, Any]):
             valid = {ff.name for ff in fields(ChannelCfg)}
             kwargs[name] = [ChannelCfg(**{k: v for k, v in c.items() if k in valid})
                             for c in val if isinstance(c, dict)]
+        elif name == "mask_regions" and isinstance(val, list):
+            valid = {ff.name for ff in fields(MaskRegionCfg)}
+            masks = []
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                values = {k: v for k, v in item.items() if k in valid}
+                # Cấu hình cũ chưa có timing_mode: vùng phụ đề cũ phải chuyển
+                # sang đồng bộ cue, các loại vùng khác giữ nguyên toàn video.
+                if ("timing_mode" not in item
+                        and item.get("purpose") == "old_subtitle"):
+                    values["timing_mode"] = "subtitle"
+                elif ("timing_mode" not in item
+                      and float(item.get("end_seconds") or 0.0)
+                      > float(item.get("start_seconds") or 0.0)):
+                    values["timing_mode"] = "custom"
+                masks.append(MaskRegionCfg(**values))
+            kwargs[name] = masks
         elif is_dataclass(ftype) and isinstance(val, dict):
             kwargs[name] = _build(ftype, val)
         else:

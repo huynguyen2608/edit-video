@@ -70,6 +70,27 @@ def test_paused_job_not_autopicked_but_counts_as_waiting(tmp_path):
     assert qm.dashboard()["waiting"] == 1             # nhưng đếm ở 'Đang chờ'
 
 
+def test_pause_and_resume_all_waiting_and_active_jobs(tmp_path):
+    inp = tmp_path / "in"; inp.mkdir()
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        _mk(inp / name)
+    qm, db = _qm(tmp_path)
+    ids = qm.import_paths([str(inp)])["eligible"]
+    db.set_edit_status(ids[0], "processing")
+    db.update_job(ids[0], job_status=Status.RENDERING, stage="Rendering", progress=42)
+
+    assert qm.pause_all() == 3
+    rows = {r["video_id"]: r for r in db.all_video_rows()}
+    assert all(display_status(rows[vid]) == Status.PAUSED for vid in ids)
+    assert qm.next_pending() is None
+
+    assert qm.resume_paused() == 3
+    rows = {r["video_id"]: r for r in db.all_video_rows()}
+    assert all(display_status(rows[vid]) == Status.WAITING for vid in ids)
+    assert all(rows[vid]["progress"] == 0 for vid in ids)
+    assert qm.next_pending() in ids
+
+
 def test_dashboard_counts(tmp_path):
     inp = tmp_path / "in"; inp.mkdir()
     for n in ("a.mp4", "b.mp4", "c.mp4"):

@@ -91,12 +91,13 @@ class EditPipeline:
             return self.process_one(row)
         except EditCancelled:
             self.db.set_edit_status(row.video_id, "pending", error=None)
-            self.db.log_event("edit", f"đã dừng edit {row.video_id}")
+            self.db.log_event("edit", f"Đã dừng edit: {row.title or row.video_id}")
             self._log(f"  ‖ đã dừng video {row.video_id}; có thể chạy lại từ hàng đợi.")
             raise
         except Exception as e:
             self.db.set_edit_status(row.video_id, "failed", error=str(e))
-            self.db.log_event("edit", f"lỗi edit {row.video_id}: {e}", level="ERROR")
+            self.db.log_event(
+                "edit", f"Edit lỗi: {row.title or row.video_id} — {e}", level="ERROR")
             self._log(f"  ! edit lỗi {row.video_id}: {e}")
             log.exception("edit fail %s", row.video_id)
             return None
@@ -106,7 +107,6 @@ class EditPipeline:
         if not row.download_path or not Path(row.download_path).exists():
             raise FileNotFoundError(f"Không thấy file tải: {row.download_path}")
 
-        self.db.log_event("edit", f"bắt đầu edit {row.video_id}")
         self._log(f"Đang edit: {row.title} ({row.video_id})")
         ecfg = self.cfg.editor
         if ecfg.fingerprint_enabled:      # biến đổi nhẹ MỖI video để chống trùng
@@ -125,6 +125,10 @@ class EditPipeline:
                 and float(dims.duration) > 600.0):
             return self._process_split_video(
                 ecfg, row, src, out_base, segment_minutes)
+        # Chỉ ghi sau khi đã xác định đây là một file đầu ra độc lập. Video dài
+        # được chia sẽ để từng part_row tự ghi cặp bắt đầu/kết thúc riêng.
+        shown_name = row.title.strip() or row.video_id
+        self.db.log_event("edit", f"Bắt đầu edit: {shown_name}")
         if ecfg.fill_missing == "none" and ecfg.crop_mode == "auto":   # smart-crop thực chạy
             self._stage(row.video_id, Stage.SMART_CROP)
         fx, fy = self._resolve_focus(ecfg, src)
@@ -135,6 +139,20 @@ class EditPipeline:
         # lúc render, nên có thể cấu hình chung một lần cho cả list.
         vocals, content_txt, srt_path, hook_sug, generated_voiceover = \
             self._prepare_audio_and_content(ecfg, row, src, out_base)
+        synced_masks = [
+            mask for mask in (getattr(ecfg, "mask_regions", []) or [])
+            if getattr(mask, "visible", True)
+            and getattr(mask, "timing_mode", "full") == "subtitle"]
+        if synced_masks and not srt_path:
+            self._log(
+                "  ! Vùng che phụ đề cũ đang chọn 'Khi có phụ đề mới' nhưng "
+                "không có SRT/ASS; vùng này sẽ không che xuyên suốt video.")
+        elif synced_masks:
+            try:
+                cue_count = len(subtitles.read_subtitle(srt_path))
+            except OSError:
+                cue_count = 0
+            self._log(f"  ✔ vùng che phụ đề cũ đồng bộ theo {cue_count} câu phụ đề")
         artifact_id = safe_name(
             Path(src).stem if self._segment_mode else row.video_id, max_len=120)
         overlay_ass = self._build_overlay_ass(
@@ -186,11 +204,13 @@ class EditPipeline:
         self._stage(row.video_id, Stage.SAVING)
         self.db.log_export(row.video_id, row.channel_name, str(out_base),
                            full_path=outs.full, short_path=outs.short,
-                           content_txt=outs.content_txt, srt_path=outs.srt)
+                           content_txt=outs.content_txt, srt_path=outs.srt,
+                           video_title=row.title)
         if not self._segment_mode:
             self.db.set_edit_status(row.video_id, "done")
             self._stage(row.video_id, Stage.COMPLETED)
         n_files = sum(1 for f in (outs.full, outs.short, outs.content_txt, outs.srt) if f)
+        self.db.log_event("edit", f"Kết thúc edit: {shown_name}")
         self._log(f"  ✔ xong; đã lưu {n_files} file vào {out_base} và ghi log xuất bản.")
         return outs
 
